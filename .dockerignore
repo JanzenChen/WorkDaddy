@@ -1,0 +1,9 @@
+.git
+.github
+test
+docs
+**/.DS_Store
+*.log
+release
+examples
+tools

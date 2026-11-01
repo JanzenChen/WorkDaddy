@@ -1,0 +1,24 @@
+services:
+  workdaddy:
+    build: .
+    image: workdaddy:local
+    container_name: workdaddy
+    user: "${WORKDADDY_UID:-501}:${WORKDADDY_GID:-20}"
+    ports:
+      - "127.0.0.1:47900:47900"
+    environment:
+      HOME: /host-home
+      XDG_CONFIG_HOME: /host-config
+      XDG_DATA_HOME: /host-config
+      WBSWITCH_PROFILE: workbuddy-cn
+      WBSWITCH_DATA_DIR: /host-config/WorkDaddy
+      WBSWITCH_PORT: "47900"
+      WBSWITCH_BIND_HOST: 0.0.0.0
+    volumes:
+      - ${HOME}/.workbuddy:/host-home/.workbuddy
+      - ${HOME}/.codebuddy:/host-home/.codebuddy
+      - ${HOME}/Library/Application Support/CodeBuddyExtension:/host-config/CodeBuddyExtension
+      - ${HOME}/Library/Application Support/WorkDaddy:/host-config/WorkDaddy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

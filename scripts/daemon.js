@@ -14,6 +14,7 @@
  *   WBSWITCH_AUTH_FILE   登录信息文件路径（默认 CodeBuddyExtension 下 auth/workbuddy-desktop.info）
  *   WBSWITCH_DATA_DIR    备份数据目录（默认 ~/Library/Application Support/WorkDaddy）
  *   WBSWITCH_PORT        Web 界面端口（显式指定时固定；未指定时从 47832 起尝试）
+ *   WBSWITCH_BIND_HOST   HTTP 监听地址（默认 127.0.0.1；容器内需设为 0.0.0.0 才能映射端口）
  *   WBSWITCH_CDP_PORT    WorkBuddy CDP 首选端口（被占用时自动切换到 9222-9232/9333）
  *   WBSWITCH_WORKBUDDY_BIN / WBSWITCH_WORKBUDDY_VERSION
  *                         VPC/便携版目标程序路径与可选版本校验
@@ -530,8 +531,8 @@ const primaryAccountStore = createPrimaryAccountStore(DATA_DIR, (uid) => fs.exis
 // 1.2.65：兼容空会话同步、自定义模型和重定向备份目录，工作目录恢复退避重试。
 // 1.2.66：刷新凭据按原信封加密保存，同账号刷新去重，过期账号保留手动切换。
 // 1.2.67：Windows 重启 GUI 客户端时不再请求隐藏主窗口，与冷启动保持一致。
-const DAEMON_VERSION = '1.2.68';
-const DAEMON_BUILD_ID = 'release-1.2.68-login-page-persona-switch';
+const DAEMON_VERSION = '1.2.69';
+const DAEMON_BUILD_ID = 'release-1.2.69-docker-bind-host';
 const usageReporter = createUsageReporter({ profile: PROFILE.id, version: DAEMON_VERSION });
 configureAutomationRuntime({version: DAEMON_VERSION, profileId: PROFILE.id, platform: process.platform});
 const automationDiscovery = createAutomationDiscovery({
@@ -544,6 +545,8 @@ const automationLikes = createAutomationLikesClient({
   getActorId: persistentInstallationId,
 });
 const HOST = '127.0.0.1';
+// 注入面板和日志仍使用 loopback 地址。容器部署只放宽监听网卡，避免把 0.0.0.0 写进客户端请求地址。
+const BIND_HOST = process.env.WBSWITCH_BIND_HOST || HOST;
 // 平台分支开关。上游历史代码把「非 Windows」一律当 macOS，Linux 适配时拆成
 // IS_MAC / IS_LINUX 两个显式常量，避免 Linux 走进 /Applications、osascript 等分支。
 const IS_WIN = process.platform === 'win32';
@@ -13129,10 +13132,10 @@ function startServer() {
         process.exit(1);
       }
     });
-    server.listen(port, HOST, () => {
+    server.listen(port, BIND_HOST, () => {
       ACTUAL_PORT = port;
       writeUiPortFile(port);
-      log(`[http] Web 界面: http://${HOST}:${port}  (数据目录: ${DATA_DIR})`);
+      log(`[http] Web 界面: http://${HOST}:${port}  (监听 ${BIND_HOST}，数据目录: ${DATA_DIR})`);
     });
   };
   tryListen(0);
