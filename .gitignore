@@ -30,3 +30,6 @@ scripts/picker-internal.js
 
 # 构建缓存(安装器临时产物)
 release/.cache/
+
+# 本地 compose 覆盖（端口等），不入库
+.env

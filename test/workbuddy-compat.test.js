@@ -278,6 +278,41 @@ test('Windows encrypted-field lookup keeps WorkBuddy key providers available for
   assert.equal(candidates.includes('C:\\Users\\tester\\AppData\\Local\\Programs\\CodeBuddy CN\\CodeBuddy CN.exe'), false);
 });
 
+test('injected compat key is read from env or key file and never persisted', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'workdaddy-compat-key-'));
+  const key = Buffer.alloc(32, 7);
+  const b64 = key.toString('base64');
+  const keyFile = path.join(root, '.wb-compat-key');
+  fs.writeFileSync(keyFile, b64 + '\n', { mode: 0o600 });
+  const previousKey = process.env.WORKDADDY_WB_KEY;
+  const previousFile = process.env.WORKDADDY_WB_KEY_FILE;
+  try {
+    delete process.env.WORKDADDY_WB_KEY;
+    delete process.env.WORKDADDY_WB_KEY_FILE;
+    assert.equal(lib.wdCompatInjectedKey(), null);
+
+    // 整行 `WD_COMPAT_KEY <base64>` 输出也应可用，方便直接粘贴脚本结果。
+    process.env.WORKDADDY_WB_KEY = 'WD_COMPAT_KEY ' + b64;
+    assert.deepEqual(lib.wdCompatInjectedKey(), key);
+
+    delete process.env.WORKDADDY_WB_KEY;
+    process.env.WORKDADDY_WB_KEY_FILE = keyFile;
+    assert.deepEqual(lib.wdCompatInjectedKey(), key);
+
+    fs.writeFileSync(keyFile, 'not-a-key\n');
+    assert.throws(() => lib.wdCompatInjectedKey(), /密钥格式无效/);
+
+    process.env.WORKDADDY_WB_KEY_FILE = path.join(root, 'missing');
+    assert.throws(() => lib.wdCompatInjectedKey(), /密钥文件不可读/);
+  } finally {
+    if (previousKey === undefined) delete process.env.WORKDADDY_WB_KEY;
+    else process.env.WORKDADDY_WB_KEY = previousKey;
+    if (previousFile === undefined) delete process.env.WORKDADDY_WB_KEY_FILE;
+    else process.env.WORKDADDY_WB_KEY_FILE = previousFile;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('account backup keeps both legacy plaintext and encrypted source bytes unchanged', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'workdaddy-compat-'));
   try {

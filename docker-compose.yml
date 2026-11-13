@@ -5,15 +5,17 @@ services:
     container_name: workdaddy
     user: "${WORKDADDY_UID:-501}:${WORKDADDY_GID:-20}"
     ports:
-      - "127.0.0.1:47900:47900"
+      - "127.0.0.1:${WORKDADDY_PORT:-47900}:${WORKDADDY_PORT:-47900}"
     environment:
       HOME: /host-home
       XDG_CONFIG_HOME: /host-config
       XDG_DATA_HOME: /host-config
       WBSWITCH_PROFILE: workbuddy-cn
       WBSWITCH_DATA_DIR: /host-config/WorkDaddy
-      WBSWITCH_PORT: "47900"
+      WBSWITCH_PORT: "${WORKDADDY_PORT:-47900}"
       WBSWITCH_BIND_HOST: 0.0.0.0
+      # 容器内没有 WorkBuddy 二进制，密钥由宿主机 `tools/wd-compat-key.sh` 派生后注入。
+      WORKDADDY_WB_KEY_FILE: /host-config/WorkDaddy/.wb-compat-key
     volumes:
       - ${HOME}/.workbuddy:/host-home/.workbuddy
       - ${HOME}/.codebuddy:/host-home/.codebuddy

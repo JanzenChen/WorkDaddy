@@ -171,10 +171,57 @@ function wdCompatExeCandidates() {
   return ['/opt/WorkBuddy/workbuddy', '/opt/WorkBuddy/workbuddy-ai'];
 }
 
+/**
+ * 无 Electron 运行时的宿主（典型：Linux 容器）无法现场派生密钥，改为由外部注入：
+ *   WORKDADDY_WB_KEY      base64 密钥（32 字节），或 `WD_COMPAT_KEY <base64>` 整行输出
+ *   WORKDADDY_WB_KEY_FILE 存有上述内容的文件路径（建议 0600）
+ * 只读进内存，不落盘、不写日志。未配置返回 null，继续走可执行文件派生。
+ */
+function wdCompatInjectedKey() {
+  const parse = (raw, source) => {
+    const text = String(raw == null ? '' : raw).trim();
+    if (!text) return null;
+    const m = text.match(/([A-Za-z0-9+/]{43}=?=?)/);
+    if (!m) throw new Error(`${source} 中的密钥格式无效`);
+    const key = Buffer.from(m[1], 'base64');
+    if (key.length !== 32) throw new Error(`${source} 中的密钥长度错误（需 32 字节）`);
+    return key;
+  };
+  const envKey = parse(process.env.WORKDADDY_WB_KEY, 'WORKDADDY_WB_KEY');
+  if (envKey) return envKey;
+  const file = String(process.env.WORKDADDY_WB_KEY_FILE || '').trim();
+  if (!file) return null;
+  let content;
+  try {
+    content = fs.readFileSync(file, 'utf8');
+  } catch (e) {
+    throw new Error(`密钥文件不可读: ${file}`);
+  }
+  const fileKey = parse(content, file);
+  if (!fileKey) throw new Error(`密钥文件为空: ${file}`);
+  return fileKey;
+}
+
 function wdCompatStaticKey() {
   if (WD_COMPAT.key) return WD_COMPAT.key;
   if (WD_COMPAT.keyFailAt && Date.now() - WD_COMPAT.keyFailAt < WD_COMPAT_KEY_RETRY_MS) {
     throw new Error(WD_COMPAT.keyFailReason || '取钥暂不可用');
+  }
+  try {
+    const injected = wdCompatInjectedKey();
+    if (injected) {
+      WD_COMPAT.key = injected;
+      WD_COMPAT.keyFailAt = 0;
+      WD_COMPAT.keyFailReason = '';
+      wdCompatLog(`取钥成功：使用外部注入密钥（${process.env.WORKDADDY_WB_KEY ? 'WORKDADDY_WB_KEY' : process.env.WORKDADDY_WB_KEY_FILE ? 'WORKDADDY_WB_KEY_FILE' : 'env'}）`);
+      return WD_COMPAT.key;
+    }
+  } catch (e) {
+    const reason = String((e && e.message) || e).slice(0, 160);
+    WD_COMPAT.keyFailAt = Date.now();
+    WD_COMPAT.keyFailReason = reason;
+    wdCompatLog(`取钥失败（外部注入，60s 后重试）: ${reason}`);
+    throw new Error(reason);
   }
   let lastErr = '未找到 WorkBuddy 可执行文件';
   for (const exe of wdCompatExeCandidates()) {
@@ -1954,6 +2001,7 @@ module.exports = {
   isWbEncryptedEnvelope, // [wd-compat]
   wdCompatExeCandidates, // [wd-compat]
   wdCompatWindowsExeCandidates, // [wd-compat]
+  wdCompatInjectedKey, // [wd-compat]
   wdCompatContainsEncryptedFields, // [wd-compat]
   wdCompatText, // [wd-compat]
   wdCompatAuthToken, // [wd-compat]
