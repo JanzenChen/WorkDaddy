@@ -282,7 +282,8 @@ function createFabQuietMode(options) {
     var height = fab.offsetHeight * 0.5;
     var right = parseFloat(fab.style.right) || 22;
     var bottom = parseFloat(fab.style.bottom) || 22;
-    return { width: width, height: height, right: right,
+    var edge = options.rightEdge ? options.rightEdge() : win.innerWidth;
+    return { width: width, height: height, right: right - (win.innerWidth - edge), edge: edge,
       left: win.innerWidth - right - width, centerY: win.innerHeight - bottom - height / 2 };
   }
   function cancel() {
@@ -293,23 +294,26 @@ function createFabQuietMode(options) {
     if (!alive) return;
     cancel();
     fab.classList.remove('is-quiet');
-    if (fab.classList.contains('hidden')) near = false;
-    if (!enabled || near || fab.classList.contains('hidden') || options.isDragging()) return;
+    if ((fab.classList.contains('hidden') || fab.classList.contains('is-area-hidden'))) near = false;
+    if (!enabled || near || (fab.classList.contains('hidden') || fab.classList.contains('is-area-hidden')) || options.isDragging()) return;
     timer = setTimeout(function () {
       timer = null;
-      if (!alive || near || fab.classList.contains('hidden') || options.isDragging() || fab.contains(doc.activeElement)) return;
+      if (!alive || near || (fab.classList.contains('hidden') || fab.classList.contains('is-area-hidden')) || options.isDragging() || fab.contains(doc.activeElement)) return;
       var box = geometry();
       // 左转后头顶朝左：头部只露 4px；停靠时 CSS 隐藏天线。
       fab.style.setProperty('--wbs-fab-quiet-shift', (box.right + box.width / 2 + box.height / 2 - 4) + 'px');
+      // A chat edge inside the window cannot rely on viewport clipping.
+      // Convert the overflow back to the robot's unscaled coordinates.
+      fab.style.setProperty('--wbs-fab-quiet-clip', Math.max(0, box.width + box.height - 8) + 'px');
       fab.classList.add('is-quiet');
     }, IDLE_MS);
   }
   options.listen(win, 'pointermove', function (event) {
-    if (!enabled || event.pointerType === 'touch' || fab.classList.contains('hidden') || options.isDragging()) return;
+    if (!enabled || event.pointerType === 'touch' || (fab.classList.contains('hidden') || fab.classList.contains('is-area-hidden')) || options.isDragging()) return;
     var box = geometry();
     var docked = fab.classList.contains('is-quiet');
     // 停靠时只响应露出的头部附近；恢复后扩大保活范围，方便移向按钮点击。
-    var next = event.clientX >= (docked ? win.innerWidth - 18 : box.left - 24) &&
+    var next = event.clientX >= (docked ? box.edge - 18 : box.left - 24) && event.clientX <= box.edge + 4 &&
       Math.abs(event.clientY - box.centerY) <= box.width / 2 + (docked ? 12 : 24);
     if (next !== near) { near = next; wake(); }
   }, { capture: true, passive: true });
@@ -377,8 +381,8 @@ function classifyAutoContinueReply(snapshot) {
   if (s.serviceErrorFallback) {
     return { trigger: false, reason: 'service-error-fallback' };
   }
-  if (s.nonRetryableError || s.quotaExhausted || s.rateLimited || s.authFailure) {
-    return { trigger: false, reason: s.rateLimited ? 'model-rate-limited' : (s.quotaExhausted ? 'quota-exhausted' : 'non-retryable-error') };
+  if (s.nonRetryableError || s.quotaExhausted || s.usageLimited || s.rateLimited || s.authFailure) {
+    return { trigger: false, reason: s.rateLimited ? 'model-rate-limited' : (s.usageLimited ? 'model-usage-limited' : (s.quotaExhausted ? 'quota-exhausted' : 'non-retryable-error')) };
   }
   if (s.error || s.networkFailure) {
     return { trigger: true, reason: s.networkFailure ? 'network-failure' : 'error-ui' };
@@ -387,7 +391,7 @@ function classifyAutoContinueReply(snapshot) {
   return { trigger: false, reason: 'no-incomplete-evidence' };
 }
 
-var AUTO_CONTINUE_QUOTA_CODES = { 14012: true, 14014: true, 14018: true, 14019: true, 6004: true };
+var AUTO_CONTINUE_QUOTA_CODES = { 14012: true, 14014: true, 14018: true, 14019: true, 6000: true, 6004: true };
 
 function normalizeAutoContinueError(error) {
   if (!error || typeof error !== 'object') return null;
@@ -401,9 +405,10 @@ function normalizeAutoContinueError(error) {
     }
     return null;
   }
-  // The official cap banner gives terminal.bizCode=6004 precedence over the
-  // outer transport code (including 0/500), so statistics must do the same.
-  var code = Number(terminal.bizCode) === 6004 ? 6004 : numberValue(error.code, error.bizCode, terminal.bizCode, details.code);
+  // Official model limits use terminal.bizCode even when the outer request
+  // reports a transport error.
+  var code = Number(terminal.bizCode) === 6000 || Number(terminal.bizCode) === 6004
+    ? Number(terminal.bizCode) : numberValue(error.code, error.bizCode, terminal.bizCode, details.code);
   var statusCode = numberValue(error.statusCode, error.status, error.httpStatus);
   var requestModelId = String(error.requestModelId || error.modelId || details.requestModelId || '').slice(0, 160);
   var category = String(error.category || error.type || details.category || '').slice(0, 80).toLowerCase();
@@ -414,6 +419,7 @@ function normalizeAutoContinueError(error) {
     return typeof value === 'string';
   }).map(function (value) { return value.slice(0, 4096); }).join(' ');
   var rateLimited = code === 6004 || statusCode === 429 || /rate.?limit|频率|限流/i.test(category + ' ' + message);
+  var usageLimited = code === 6000;
   var quotaExhausted = code === 14018 || code === 14012 || code === 14014 || code === 14019 || /quota|credit|额度|积分|余额/i.test(category + ' ' + message);
   var authFailure = statusCode === 401 || statusCode === 403 || /auth|credential|登录|认证/i.test(category + ' ' + message);
   var resetAt = null;
@@ -441,9 +447,10 @@ function normalizeAutoContinueError(error) {
     requestModelId: requestModelId,
     resetAt: resetAt,
     rateLimited: rateLimited,
+    usageLimited: usageLimited,
     quotaExhausted: quotaExhausted,
     authFailure: authFailure,
-    nonRetryable: rateLimited || quotaExhausted || authFailure || AUTO_CONTINUE_QUOTA_CODES[code] === true,
+    nonRetryable: rateLimited || usageLimited || quotaExhausted || authFailure || AUTO_CONTINUE_QUOTA_CODES[code] === true,
     terminal: terminal === error.terminal || terminal.isTerminal === true,
   };
 }
@@ -459,14 +466,15 @@ function createModelRateLimitObserver(options) {
       var state = controller.sessionStore.getState() || {};
       [state.error, state.warning].forEach(function (error) {
         var normalized = normalizeAutoContinueError(error);
-        if (!normalized || normalized.code !== 6004) return;
+        if (!normalized || (normalized.code !== 6004 && normalized.code !== 6000)) return;
         var modelId = normalized.requestModelId || String(state.model || state.modelId || '');
         if (!modelId) return;
         binding.latest = {
           conversationId: String(controller.conversationId || ''),
           assistantId: String(error.requestId || ''),
-          rateLimited: true,
-          errorCode: 6004,
+          rateLimited: normalized.code === 6004,
+          limitType: normalized.code === 6000 ? 'usage' : 'frequency',
+          errorCode: normalized.code,
           errorRequestModelId: modelId,
           errorModelName: modelId,
           errorResetAt: normalized.resetAt,
@@ -514,6 +522,7 @@ function classifyAutoContinueError(error) {
   var normalized = normalizeAutoContinueError(error) || {};
   return {
     quotaExhausted: !!normalized.quotaExhausted,
+    usageLimited: !!normalized.usageLimited,
     rateLimited: !!normalized.rateLimited,
     authFailure: !!normalized.authFailure,
     nonRetryable: !!normalized.nonRetryable,
@@ -538,6 +547,7 @@ function classifyAutoContinueControllerSnapshot(snapshot) {
     terminal: !!s.terminal,
     serviceErrorFallback: !!s.serviceErrorFallback,
     quotaExhausted: !!s.quotaExhausted,
+    usageLimited: !!s.usageLimited,
     rateLimited: !!s.rateLimited,
     authFailure: !!s.authFailure,
     nonRetryableError: !!s.nonRetryableError,
@@ -572,6 +582,7 @@ function controllerAutoContinueDecision(snapshot) {
     completionMarker: s.completionMarker,
     serviceErrorFallback: s.serviceErrorFallback,
     quotaExhausted: s.quotaExhausted,
+    usageLimited: s.usageLimited,
     rateLimited: s.rateLimited,
     authFailure: s.authFailure,
     nonRetryableError: s.nonRetryableError,
@@ -820,10 +831,10 @@ function isSessionMonitorInProgress(snapshot) {
 function isSessionMonitorInterrupted(snapshot) {
   var s = snapshot || {};
   if (!s || s.busy || s.blocked || s.hydrating) return false; // 运行/等决策/恢复中：交给 in-progress 分支
-  // 额度/限频错误通常同时带有 terminal=true 和 serviceErrorFallback=true。
+  // 限额错误通常同时带有 terminal=true 和 serviceErrorFallback=true。
   // 它们必须进入一次监控判定，先落盘模型限频记录并刷新账号标签；
   // controllerAutoContinueDecision 仍会因终局证据返回 trigger=false，因此不会自动重试。
-  if (s.rateLimited || s.quotaExhausted) return true;
+  if (s.rateLimited || s.usageLimited || s.quotaExhausted) return true;
   return controllerAutoContinueDecision(s).trigger === true;
 }
 
@@ -961,13 +972,20 @@ function createSessionDirtyTracker(send, options) {
   function queue(update) {
     var id = String(update && update.id || '').trim();
     if (!id) return false;
-    pending[id] = { id: id, event: String(update.event || 'sessionUpdated').slice(0, 40) };
+    // Do not let a trailing lifecycle update overwrite an explicit deletion.
+    if (!pending[id] || pending[id].event !== 'sessionDeleted') {
+      pending[id] = { id: id, event: String(update.event || 'sessionUpdated').slice(0, 40) };
+    }
     if (timer == null) timer = setTimeout(flush, delay);
     return true;
   }
   function observe(update) {
     var id = String(update && update.id || '').trim();
     if (!id) return false;
+    if (update.event === 'sessionDeleted') {
+      delete seen[id];
+      return queue(update);
+    }
     var next = signature(update);
     if (seen[id] === undefined) {
       seen[id] = next;
@@ -1158,7 +1176,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     var n;
     if ((n = document.querySelector('.wbs-root'))) n.remove();
     if ((n = document.getElementById('wbs-window-logo'))) n.remove();
-    var st = document.querySelectorAll('.wbs-stash-inline, .wbs-stash-btn, .wbs-explore-inline, .wbs-explore-pop, .wbs-fork-button');
+    var st = document.querySelectorAll('.wbs-stash-inline, .wbs-stash-btn, .wbs-explore-inline, .wbs-explore-pop, #wbs-qp-insert-tooltip, .wbs-fork-button');
     for (var i = 0; i < st.length; i++) st[i].remove();
     var nav = document.querySelectorAll('.wbs-message-nav-root');
     for (var ni = 0; ni < nav.length; ni++) nav[ni].remove();
@@ -1499,6 +1517,42 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   var WBS_ACCOUNT_NOTE_HOVER_KEY = 'workdaddy.account.noteHover.' + PROFILE_ID;
   var WBS_GROWTH_PLAN_HOVER_KEY = 'workdaddy.account.growthPlanHover.' + PROFILE_ID;
   var WBS_I18N_EN = {
+    '客户端临时文件': 'Client temporary files',
+    '仅清理当前客户端 7 天未修改的临时项目，保留近期文件和官方更新缓存。请先保存需要的临时产物并结束任务。': 'Clean only temporary items unchanged for 7 days in this client. Recent files and official update caches are kept. Save any needed temporary work and end tasks first.',
+    '点击统计查看占用': 'Calculate to view usage',
+    '统计占用': 'Calculate usage',
+    '下次启动清理': 'Clean on next launch',
+    '取消清理': 'Cancel cleanup',
+    '已安排：完全退出客户端并结束相关任务后，通过': 'Scheduled: fully quit the client and end related tasks, then launch through',
+    ' 再次启动时清理。': ' to clean temporary files.',
+    '占用 ': 'Used ',
+    ' · 可清理 ': ' · Eligible ',
+    '（统计不完整，无法读取的项目将保留）': ' (Partial scan; unreadable items will be kept)',
+    ' · 上次已清理 ': ' · Last cleaned ',
+    '（部分项目已跳过）': ' (Some items were skipped)',
+    '正在统计临时文件…': 'Calculating temporary file usage…',
+    '统计失败，请重试': 'Could not calculate usage. Try again',
+    '安排清理临时文件？': 'Schedule temporary file cleanup?',
+    '清理无法撤销。请保存需要的临时产物，完全退出客户端并结束相关任务，再通过 WorkDaddy 启动。仅处理 7 天未修改的临时项目，保留官方更新缓存；账号备份和正式会话目录不在清理范围内。': 'Cleanup cannot be undone. Save needed temporary work, fully quit the client and end related tasks, then launch through WorkDaddy. Only temporary items unchanged for 7 days are eligible. Official update caches, account backups and session directories are excluded.',
+    '清理无法撤销。请保存需要的临时产物，完全退出客户端并结束相关任务，再通过 WorkDaddy AI 启动。仅处理 7 天未修改的临时项目，保留官方更新缓存；账号备份和正式会话目录不在清理范围内。': 'Cleanup cannot be undone. Save needed temporary work, fully quit the client and end related tasks, then launch through WorkDaddy AI. Only temporary items unchanged for 7 days are eligible. Official update caches, account backups and session directories are excluded.',
+    '安排清理': 'Schedule cleanup',
+    '无法统计临时文件，请检查目录权限后重试': 'Cannot calculate temporary file usage. Check folder permissions and try again.',
+    '当前客户端不支持此清理请求': 'This client does not support this cleanup request.',
+    '保存清理请求失败，请重试': 'Could not save the cleanup request. Try again.',
+    '个人版与企业版共用官方会话 UID，无法可靠区分会话归属，已停止同步；账号备份和切换仍可使用': 'Personal and enterprise accounts share an official session UID. Sync stopped because ownership is ambiguous; account backup and switching remain available',
+    '会话数据库正被占用，请稍后重新同步': 'Session database is busy. Please retry later',
+    '没有读取或写入会话文件的权限，请检查文件权限后重新同步': 'Cannot access session files. Check permissions and retry',
+    '会话数据库或文件不存在，请确认 WorkBuddy 已正常启动后重新同步': 'Session database or file is missing. Start WorkBuddy and retry',
+    '磁盘空间不足，请释放空间后重新同步': 'Disk is full. Free space and retry',
+    '会话数据库无法读取，请先检查 WorkBuddy 是否能正常打开会话': 'Session database is unreadable. Check whether WorkBuddy can open sessions',
+    '会话数据库结构不兼容，请更新 WorkDaddy 后重新同步': 'Session database schema is incompatible. Update WorkDaddy and retry',
+    '同步任务异常中断，请稍后重新同步；若仍失败，请反馈客户端版本及同步阶段': 'Sync task interrupted. Retry later; if it persists, report the client version and sync stage',
+
+    '任务失败': 'Task failed',
+    '同步任务': 'Sync task',
+    '请查看明细': 'Please view details',
+    '同步任务异常中断，请稍后重新同步': 'Sync task interrupted. Please retry later',
+    '企业身份的个性化目录尚未确认，暂不支持共享个性化': 'Enterprise personalization directory is unverified; sharing is unavailable',
     "同步个性化": "Sync personalization",
     "不再提醒": "Don't remind me again",
     "了解同步个性化": "About personalization sync",
@@ -1611,6 +1665,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '会话文件校验失败': 'Session file verification failed',
     '收起': 'Collapse',
     '输入框仍有内容，未确认发送；不会自动重发': 'The composer still contains text, so sending was not confirmed. It will not be retried automatically',
+    '今日已派猫': 'Buddy sent today', '今日未派猫': 'Buddy not sent today',
     '派猫猫旅行': 'Send Buddy traveling',
     '自动选择已拥有的 Buddy，派出旅行并领取旅行礼物。未领养 Buddy 的账号需先在官网同意协议并解锁，此任务会跳过。需要 WorkDaddy 1.2.66 或更新版本。': 'Select an owned Buddy, send it traveling, and claim travel gifts. Accounts without an adopted Buddy are skipped until the agreement is accepted and Buddy is unlocked on the official site. Requires WorkDaddy 1.2.66 or later.',
     '账号 {account}：开始检查猫猫旅行': 'Account {account}: Checking Buddy travel', '当前 Buddy 查询失败': 'Could not load current Buddy', 'Buddy 列表查询失败': 'Could not load Buddy list',
@@ -1722,7 +1777,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '停止运行': 'Stop running',
     '账号': 'Accounts', '主题': 'Theme', '会话': 'Sessions', '模型': 'Models', '增强': 'Enhance', '自动化': 'Automation', '电脑': 'Computer', '关于': 'About', '设置': 'Settings',
     '导出': 'Export', '导入': 'Import', '删除': 'Delete', '编辑': 'Edit', '保存': 'Save', '内置': 'Built-in', '取消': 'Cancel', '确定': 'Confirm', '确认': 'Confirm', '复制': 'Copy', '切换': 'Switch', '启用': 'Enable', '停用': 'Disable', '停止': 'Stop', '立即运行': 'Run now', '新建任务': 'New task', '刷新': 'Refresh', '步骤 JSON': 'Steps JSON', '任务说明': 'Task description', '任务名称': 'Task name', '调度': 'Schedule', '手动运行': 'Manual', '手动': 'Manual', '每小时': 'Hourly', '每天': 'Daily', '选择任务': 'Select tasks', '查看接口': 'View capabilities', '拾取元素': 'Pick element', '复制 XPath': 'Copy XPath', '运行中': 'Running', '已成功': 'Succeeded', '失败': 'Failed', '未运行': 'Not run', '页面加载完成': 'Page loaded', '账号切换完成': 'Account switched', '新自动化任务': 'New automation task', '任务已保存': 'Task saved', '任务已开始运行': 'Task started', '步骤 JSON 格式无效': 'Invalid steps JSON', '步骤 JSON 必须是数组': 'Steps JSON must be an array', '查看接口说明': 'View interface docs', '自动化接口协议': 'Automation interface protocol', '复制全部': 'Copy all', '接口协议已复制': 'Interface protocol copied', '暂无自动化任务': 'No automations yet', '编辑任务': 'Edit task', '触发方式': 'Trigger', '插入点击步骤': 'Insert click step', 'XPath 已复制': 'XPath copied', '点击步骤已插入': 'Click step inserted', '请先拾取元素': 'Pick an element first', '加载自动化失败': 'Failed to load automations', '读取接口失败': 'Failed to read interfaces', '批量操作失败': 'Batch operation failed', '删除失败': 'Delete failed', '确认删除该任务？': 'Delete this task?', '执行': 'Apply', '已拾取': 'Picked', '运行失败': 'Run failed', '（副本）': ' (copy)', '查看提示词': 'View prompt', '交给 WorkBuddy 创建': 'Ask WorkBuddy to create', '正在打开新任务…': 'Opening a new task…', '已创建新会话，WorkBuddy 完成后任务会自动出现': 'New session created. The task will appear after WorkBuddy finishes.', 'WorkBuddy 创建失败': 'WorkBuddy creation failed', '加载示例失败': 'Failed to load examples', '暂无示例': 'No examples available', '运行日志': 'Run logs', '暂无运行日志': 'No run logs yet', '开始时间': 'Started', '结束时间': 'Finished', '捕获错误': 'Caught error', '暂无执行日志': 'No execution log entries', '执行日志': 'Execution log', '尚未结束': 'Still running',
-    '暂存提示词': 'Stash prompt', '暂存': 'Stashed', '引用文本': 'Quote text', '快捷短语': 'Quick phrases', '点击后发送': 'Send on click', '编辑 →': 'Edit →', '新增': 'Add', '批量操作': 'Batch actions', '批量管理': 'Batch manage', '全选': 'Select all', '取消全选': 'Deselect all', '已选 0': 'Selected 0',
+    '暂存提示词': 'Stash prompt', '暂存': 'Stashed', '引用文本': 'Quote text', '快捷短语': 'Quick phrases', '点击后发送': 'Send on click', '仅插入到对话框': 'Insert into dialog only', '拖动排序': 'Drag to reorder', '排序失败:': 'Reorder failed:', '插入失败:': 'Insert failed:', '编辑 →': 'Edit →', '新增': 'Add', '批量操作': 'Batch actions', '批量管理': 'Batch manage', '全选': 'Select all', '取消全选': 'Deselect all', '已选 0': 'Selected 0',
     '分支到新会话': 'Start a new conversation here', '从这里开始新会话': 'Start a new conversation here', '复制到这条回复为止的聊天内容，在当前工作区继续聊；原会话不变。': 'Copy the conversation up to this reply into a new conversation in the current workspace. The original stays unchanged.', '正在创建分支会话…': 'Creating branch session…', '分支会话已创建，正在打开…': 'Branch created. Opening…', '分支会话已创建，但无法自动打开，请在会话列表中查找。': 'Branch created but could not open automatically. Check the sessions list.', '新会话未出现在列表中，请在会话列表中查找。': 'The new session is not listed yet. Check the sessions list.', '无法确认所选消息的分支位置，请稍后重试': 'Cannot confirm this reply position. Try again shortly.', '分支失败: ': 'Branch failed: ',
     '账号汇总': 'Account summary', '账号数': 'Accounts', '总积分': 'Total credits', '手机': 'Phone', '有效期至': 'Expires', '当前使用中': 'Currently active', '隐藏敏感信息': 'Mask sensitive info', '显示明文': 'Show plaintext', '登录新账号': 'Log in a new account', '没有可导出的账号备份': 'No account backups to export', '还没有备份账号。打开/登录一次 WorkBuddy 后会自动备份，稍后再来查看。': 'No account backups yet. Open or log in to WorkBuddy once and check again later.',
     '软件渲染（闪屏兼容）': 'Software rendering (flicker workaround)',
@@ -1935,8 +1990,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '开启后 WorkBuddy 需要你决策时会用弹窗提问（写入全局自定义指令，所有会话生效）': 'When enabled, WorkBuddy asks with a dialog when your decision is needed (written to the global custom prompt; affects all sessions)',
     '当前没有进行中的会话，无法开启「所有会话结束允许休眠」': 'No active sessions; cannot enable “Allow sleep when all sessions end”',
     '进行中的会话': 'active session(s)', '预计剩余': 'Estimated remaining', ' 秒': ' seconds', ' 分': ' minutes',
-    '预计解封：': 'Reset estimate: ', '预计解封：时间未知': 'Reset estimate: unknown', '预计解封': 'Reset estimate', '时间未知': 'Time unknown', '模型限流': 'Model rate limited', '模型限流·': 'Model rate limited ·', '模型频率限制': 'Model rate limit', '账号状态': 'Account status', '当前没有有效的模型限流记录': 'No active model rate-limit records',
-    '当前模型已触发频率限制，已停止自动发送': 'This model is rate limited; automatic sending stopped', '当前账号积分已耗尽': 'This account has no credits left', '模型：': 'Model: ',
+    '预计解封：': 'Reset estimate: ', '预计解封：时间未知': 'Reset estimate: unknown', '预计解封': 'Reset estimate', '预计恢复：': 'Recovery estimate: ', '预计恢复：时间未知': 'Recovery estimate: unknown', '预计恢复': 'Recovery estimate', '时间未知': 'Time unknown', '模型限流': 'Model rate limited', '模型限流·': 'Model rate limited ·', '模型限制': 'Model limit', '模型限制·': 'Model limit ·', '模型频率限制': 'Model rate limit', '频率限制': 'Frequency limit', '用量限制': 'Usage limit', '账号状态': 'Account status', '当前没有有效的模型限制记录': 'No active model limit records',
+    '当前模型已触发频率限制，已停止自动发送': 'This model is rate limited; automatic sending stopped', '当前模型用量已达限制，已停止自动发送': 'This model has reached its usage limit; automatic sending stopped', '当前账号积分已耗尽': 'This account has no credits left', '模型：': 'Model: ',
     '无法打开安装程序': 'Could not open the installer',
     '安装程序已打开，请按提示退出 WorkBuddy 并完成安装。': 'The installer is open. Please quit WorkBuddy as prompted and finish installing.',
     '安装程序已打开，请到任务栏选择安装窗口；按提示退出 WorkBuddy 后完成安装。': 'The installer is open. Select its window from the taskbar, then quit WorkBuddy as prompted to finish installing.',
@@ -2002,6 +2057,16 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '无可同步的目标账号（已排除会话所属账号）': 'No target accounts to sync to (the session owner account is excluded)',
     '删除后会话将从列表中移除，该账号下的本地消息文件将被永久删除，此操作不可恢复。': 'The sessions are removed from the list and their local message files are permanently deleted; this cannot be undone.',
     '删除后会话将从列表中移除，本账号的会话及同步到其他账号的同源会话（本地消息文件）都将被永久删除，此操作不可恢复。': 'The sessions are removed from the list. These sessions and their synced counterparts in other accounts (local message files) are permanently deleted; this cannot be undone.',
+    '将删除': 'Delete', ' 个会话，涉及': ' sessions across',
+    '正在核对删除范围…': 'Checking the deletion scope…',
+    '无法核对删除范围，请关闭后重试。': 'Cannot verify the deletion scope. Close this dialog and try again.',
+    '将删除 {n} 个会话，涉及 {m} 个账号。': 'Delete {n} sessions across {m} accounts. ',
+    '包含所选会话及其所有已关联副本，删除无法撤销。': 'Includes the selected sessions and all linked copies. Deletion cannot be undone.',
+    '仅删除所选会话，保留其他副本。自动同步不会在这些账号重新生成已删除的副本；如需恢复，可手动同步。删除无法撤销。': 'Only the selected sessions will be deleted; other copies are kept. Automatic sync will not recreate deleted copies in these accounts. To restore a copy, sync it manually. Deletion cannot be undone.',
+    '含关联副本 {n} 个': ' including {n} linked copies',
+    '无效的删除范围': 'Invalid deletion scope',
+    '删除范围已变化，请重新预览并确认': 'The deletion scope has changed. Preview and confirm it again.',
+    '两端会话标题不同，已保留各自标题，请统一后重试': 'Session titles differ. Both titles were preserved; make them match and retry.',
     '含其他账号副本 {n} 个': ' including {n} other-account copies',
     '以「不让当前账号登录身份过期」的方式切到登录页，可以登录新账号，也可以切回已登录账号': 'Goes to the login page without letting the current account expire; log in a new account or switch back to an existing one.',
     '不退出 WorkBuddy，在浏览器完成授权后新账号自动加入列表': 'Keeps WorkBuddy running; after authorizing in the browser, the new account is added to the list automatically.',
@@ -3693,7 +3758,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
     function applyInjectedI18n() {
       applyI18n(root);
-      var nodes = document.querySelectorAll('.wbs-stash-inline,.wbs-queue-tag,.wbs-message-nav-root,.wbs-fork-button,#wbs-fork-tooltip,#wbs-auto-inspector,#wbs-auto-inspect-tip');
+      var nodes = document.querySelectorAll('.wbs-stash-inline,.wbs-queue-tag,.wbs-message-nav-root,.wbs-fork-button,#wbs-fork-tooltip,#wbs-qp-insert-tooltip,#wbs-auto-inspector,#wbs-auto-inspect-tip');
       for (var i = 0; i < nodes.length; i++) applyI18n(nodes[i]);
     }
     window.__wbsSetLanguage = setLanguage;
@@ -3860,7 +3925,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       '</div>';
     applyI18n(exploreBtn);
     var explorePopover = exploreBtn.querySelector('.wbs-explore-pop');
-    var exploreMenu = mountExplorePopover(exploreBtn, explorePopover);
+    var qpInsertTooltip = mountQuickPhraseInsertTooltip(explorePopover);
+    registerDisposer(qpInsertTooltip.destroy);
+    var exploreMenu = mountExplorePopover(exploreBtn, explorePopover, qpInsertTooltip.hide);
     registerDisposer(exploreMenu.destroy);
     var exploreSendTxt = explorePopover.querySelector('.wbs-explore-send-txt');
     if (exploreSendTxt) {
@@ -3911,7 +3978,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
     // Only the popup leaves the official toolbar. Its body-level stacking context
     // keeps it above the usage summary even when the composer creates its own layer.
-    function mountExplorePopover(button, popup) {
+    function mountExplorePopover(button, popup, onClose) {
       if (CAPS.enhance === false) return { close: function () {}, open: function () {}, destroy: function () {} };
       mountPersistentOverlay(popup);
       var timer = null;
@@ -3921,7 +3988,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         listeners.push(function () { target.removeEventListener(name, handler, options); });
       }
       function cancelClose() { if (timer) { clearTimeout(timer); timer = null; } }
-      function close() { cancelClose(); popup.classList.remove('is-open'); button.setAttribute('aria-expanded', 'false'); }
+      function close() { cancelClose(); popup.classList.remove('is-open'); button.setAttribute('aria-expanded', 'false'); if (onClose) onClose(); }
       function open() {
         cancelClose();
         var rect = button.getBoundingClientRect();
@@ -3954,6 +4021,37 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       listen(document, 'scroll', function (event) { if (!popup.contains(event.target)) close(); }, true);
       listen(document, 'pointerdown', function (event) { if (!button.contains(event.target) && !popup.contains(event.target)) close(); }, true);
       return { close: close, open: open, destroy: function () { close(); listeners.forEach(function (remove) { remove(); }); popup.remove(); } };
+    }
+    function mountQuickPhraseInsertTooltip(popup) {
+      var tooltip = el('span', 'wbs-telemetry-tooltip wbs-qp-insert-tooltip', '仅插入到对话框');
+      tooltip.id = 'wbs-qp-insert-tooltip';
+      tooltip.setAttribute('role', 'tooltip');
+      mountPersistentOverlay(tooltip);
+      applyI18n(tooltip);
+      var listeners = [];
+      function listen(target, name, handler, options) {
+        target.addEventListener(name, handler, options);
+        listeners.push(function () { target.removeEventListener(name, handler, options); });
+      }
+      function hide() { tooltip.classList.remove('is-visible'); popup.classList.remove('wbs-explore-action-tip'); }
+      function buttonAt(target) { return target && target.closest && target.closest('[data-qp-insert]'); }
+      function show(event) {
+        var button = buttonAt(event.target);
+        if (!button || !popup.contains(button) || !popup.classList.contains('is-open')) return;
+        var rect = button.getBoundingClientRect();
+        tooltip.classList.add('is-visible'); popup.classList.add('wbs-explore-action-tip');
+        var width = tooltip.offsetWidth, height = tooltip.offsetHeight;
+        tooltip.style.left = Math.round(Math.max(8, Math.min(window.innerWidth - width - 8, rect.left + rect.width / 2 - width / 2))) + 'px';
+        tooltip.style.top = Math.round(Math.max(8, Math.min(window.innerHeight - height - 8, rect.bottom + height + 10 < window.innerHeight ? rect.bottom + 7 : rect.top - height - 7))) + 'px';
+      }
+      listen(popup, 'pointerover', show);
+      listen(popup, 'focusin', show);
+      listen(popup, 'pointerout', function (event) { var button = buttonAt(event.target); if (button && !button.contains(event.relatedTarget)) hide(); });
+      listen(popup, 'focusout', hide);
+      listen(popup, 'click', hide, true);
+      listen(window, 'resize', hide);
+      listen(document, 'scroll', hide, true);
+      return { hide: hide, destroy: function () { hide(); listeners.forEach(function (remove) { remove(); }); tooltip.remove(); } };
     }
     function acMenuClose() {
       qpDiag('menu:close:before', { menuClass: exploreBtn.className });
@@ -3994,6 +4092,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     };
     var sessLastExploreSig = ''; // 面板选项渲染签名（内容未变不重建保留 tooltip 状态）
     var sessLastQpSig = ''; // 增强页列表渲染签名（内容/批量模式/选中集未变不重建）
+    var qpSortCleanup = null;
+    registerDisposer(function () { if (qpSortCleanup) qpSortCleanup(); qpSortCleanup = null; });
     function applySessionModule(d) {
       if (!d || !d.ok) return;
       sessState.stash = !!d.stashEnabled;
@@ -4045,6 +4145,100 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       }).finally(function () { el.disabled = false; });
     }
 
+    // Preview by moving the existing rows (and their listeners); persist only
+    // on drop. Layout offsets ignore FLIP transforms, avoiding hover jitter.
+    function createQuickPhraseSorter(list, commit, reportError) {
+      var dragging = null, original = [], saving = false, disposed = false;
+      var listeners = [], animations = new Map(), scrollFrame = null, pointerY = 0;
+      function listen(target, name, handler, options) {
+        target.addEventListener(name, handler, options);
+        listeners.push(function () { target.removeEventListener(name, handler, options); });
+      }
+      function rows() { return Array.from(list.querySelectorAll('.wbs-qp-row')); }
+      function cancelAnimations() { animations.forEach(function (a) { a.cancel(); }); animations.clear(); }
+      function move(change) {
+        var items = rows(), tops = items.map(function (row) { return row.getBoundingClientRect().top; });
+        cancelAnimations();
+        var scrollTop = list.scrollTop;
+        change();
+        list.scrollTop = scrollTop;
+        if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+        items.forEach(function (row, index) {
+          var delta = tops[index] - row.getBoundingClientRect().top;
+          if (row === dragging || !delta || !row.animate) return;
+          var animation = row.animate([{ transform: 'translateY(' + delta + 'px)' }, { transform: 'translateY(0)' }], { duration: 160, easing: 'cubic-bezier(.2,.8,.2,1)' });
+          animations.set(row, animation);
+          animation.onfinish = function () { if (animations.get(row) === animation) animations.delete(row); };
+        });
+      }
+      function preview(y) {
+        if (!dragging) return;
+        var localY = y - list.getBoundingClientRect().top - list.clientTop + list.scrollTop;
+        var before = rows().find(function (row) { return row !== dragging && localY < row.offsetTop + row.offsetHeight / 2; }) || null;
+        if (dragging.nextElementSibling === before) return;
+        move(function () { list.insertBefore(dragging, before); });
+      }
+      function stopScroll() { if (scrollFrame !== null) cancelAnimationFrame(scrollFrame); scrollFrame = null; }
+      function scrollStep() {
+        scrollFrame = null;
+        if (!dragging) return;
+        var rect = list.getBoundingClientRect(), edge = Math.min(28, rect.height / 4);
+        var speed = pointerY < rect.top + edge ? -6 : pointerY > rect.bottom - edge ? 6 : 0;
+        if (!speed || pointerY < rect.top || pointerY > rect.bottom) return;
+        var previous = list.scrollTop;
+        list.scrollTop = Math.max(0, Math.min(list.scrollHeight - list.clientHeight, previous + speed));
+        if (list.scrollTop !== previous) { preview(pointerY); scrollFrame = requestAnimationFrame(scrollStep); }
+      }
+      function finish() {
+        stopScroll();
+        if (dragging) dragging.classList.remove('wbs-qp-dragging');
+        dragging = null;
+      }
+      function restore(order) { move(function () { order.forEach(function (row) { list.appendChild(row); }); }); }
+      function cancel() { if (!dragging) return; finish(); restore(original); }
+      rows().forEach(function (row) {
+        var handle = row.querySelector('[data-qp-drag]');
+        if (!handle) return;
+        listen(handle, 'dragstart', function (event) {
+          event.stopPropagation();
+          if (saving || disposed) { event.preventDefault(); return; }
+          cancelAnimations();
+          original = rows(); dragging = row;
+          event.dataTransfer.setData('text/plain', row.getAttribute('data-id'));
+          event.dataTransfer.effectAllowed = 'move';
+          var rect = row.getBoundingClientRect();
+          if (event.dataTransfer.setDragImage) event.dataTransfer.setDragImage(row, event.clientX - rect.left, event.clientY - rect.top);
+          row.classList.add('wbs-qp-dragging');
+        });
+        listen(handle, 'dragend', function (event) { event.stopPropagation(); cancel(); });
+      });
+      listen(list, 'dragover', function (event) {
+        if (!dragging) return;
+        event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'move';
+        pointerY = event.clientY; preview(pointerY);
+        if (scrollFrame === null) scrollFrame = requestAnimationFrame(scrollStep);
+      });
+      listen(list, 'dragleave', function (event) { if (!list.contains(event.relatedTarget)) stopScroll(); });
+      listen(list, 'drop', function (event) {
+        if (!dragging) return;
+        event.preventDefault(); event.stopPropagation(); preview(event.clientY);
+        var ordered = rows(), previous = original.slice();
+        finish();
+        if (ordered.every(function (row, i) { return row === previous[i]; })) return;
+        saving = true; list.setAttribute('aria-busy', 'true');
+        Promise.resolve().then(function () { return commit(ordered.map(function (row) { return row.getAttribute('data-id'); })); })
+          .catch(function (error) { if (!disposed) { restore(previous); reportError(error); } })
+          .finally(function () { saving = false; if (!disposed) list.removeAttribute('aria-busy'); });
+      });
+      listen(document, 'keydown', function (event) {
+        if (dragging && event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); cancel(); }
+      }, true);
+      listen(window, 'blur', cancel);
+      return function () {
+        disposed = true; finish(); cancelAnimations(); list.removeAttribute('aria-busy');
+        listeners.forEach(function (remove) { remove(); });
+      };
+    }
     /** 增强页快捷短语列表渲染（含批量模式） */
     function renderQpList() {
       var pane1 = enhancePane;
@@ -4057,6 +4251,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         (phrases.length ? phrases.map(function (p) { return p.id + ':' + p.text; }).join('|') : 'empty');
       if (sig === sessLastQpSig) return;
       sessLastQpSig = sig;
+      if (qpSortCleanup) { qpSortCleanup(); qpSortCleanup = null; }
       var barEl = pane1.querySelector('#wbs-qp-batchbar');
       var countEl = pane1.querySelector('#wbs-qp-batch-count');
       var batchBtn = pane1.querySelector('#wbs-qp-batch');
@@ -4084,7 +4279,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var checked = sessState.qpSel[ph.id] ? ' checked' : '';
         var cb = sessState.qpBatch ? '<input type="checkbox" class="wbs-qp-check" data-id="' + escAttr(ph.id) + '"' + checked + '>' : '';
         html +=
-          '<div class="wbs-qp-row" data-id="' + escAttr(ph.id) + '">' +
+          '<div class="wbs-qp-row" data-id="' + escAttr(ph.id) + '" draggable="false">' +
+          (sessState.qpBatch ? '' : '<button type="button" class="wbs-qp-drag" draggable="true" data-qp-drag="' + escAttr(ph.id) + '" title="拖动排序" aria-label="拖动排序"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><circle cx="5" cy="4" r="1"/><circle cx="11" cy="4" r="1"/><circle cx="5" cy="8" r="1"/><circle cx="11" cy="8" r="1"/><circle cx="5" cy="12" r="1"/><circle cx="11" cy="12" r="1"/></svg></button>') +
           cb +
           '<span class="wbs-qp-text" title="' + escAttr(ph.text) + '">' + esc(ph.text) + '</span>' +
           '<span class="wbs-qp-actions">' +
@@ -4093,7 +4289,15 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           '</span>' +
           '</div>';
       }
+      var listScrollTop = listEl.scrollTop;
       listEl.innerHTML = html;
+      listEl.scrollTop = listScrollTop;
+      if (!sessState.qpBatch) {
+        qpSortCleanup = createQuickPhraseSorter(listEl, function (ordered) {
+          return api('/api/quick-phrase-reorder', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ids: ordered }) })
+            .then(function (d) { if (!d || !d.ok) throw new Error((d && d.error) || 'daemon 未确认'); applySessionModule(d); });
+        }, function (error) { toast('排序失败: ' + (error.message || error), true, root); syncSessionModule(); });
+      }
       var checks = listEl.querySelectorAll('.wbs-qp-check');
       for (var c = 0; c < checks.length; c++) {
         checks[c].addEventListener('change', function () {
@@ -4121,6 +4325,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var sig = phrases.length ? phrases.map(function (p) { return p.id + ':' + p.text; }).join('|') : 'empty';
       if (sig === sessLastExploreSig) return;
       sessLastExploreSig = sig;
+      qpInsertTooltip.hide();
       if (!phrases.length) {
         listHost.innerHTML = '<div class="wbs-qp-empty wbs-qp-empty-menu">暂无快捷短语</div>';
         return;
@@ -4128,8 +4333,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var html = '';
       for (var i = 0; i < phrases.length; i++) {
         var ph = phrases[i];
-        html += '<div class="wbs-explore-item" data-qp-send="' + escAttr(ph.id) + '">' +
-          '<span class="wbs-explore-it">' + esc(ph.text) + '</span>' +
+        html += '<div class="wbs-explore-item" data-qp-send="' + escAttr(ph.id) + '" role="listitem">' +
+          '<span class="wbs-explore-it" role="button" tabindex="0">' + esc(ph.text) + '</span>' +
+          '<button type="button" class="wbs-explore-insert" data-qp-insert="' + escAttr(ph.id) + '" aria-describedby="wbs-qp-insert-tooltip" aria-label="仅插入到对话框"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3.5h10a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H8l-3 2v-2H3a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1z"/><path d="M5 6h6M5 8.5h4"/></svg></button>' +
           '<span class="wbs-explore-tip"><span class="wbs-explore-tip-body">' + esc(ph.text) + '</span></span>' +
           '</div>';
       }
@@ -4161,6 +4367,27 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
             tipK.addEventListener('mouseenter', function () { if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; } });
             tipK.addEventListener('mouseleave', hideTipDelayed);
           }
+          var insertK = itemK.querySelector('[data-qp-insert]');
+          if (insertK) insertK.addEventListener('click', function (ev) {
+            ev.preventDefault(); ev.stopPropagation();
+            var insertPhrase = sessState.phrases.find(function (p) { return p.id === this.getAttribute('data-qp-insert'); }, this);
+            if (!insertPhrase) return;
+            var editor = findComposer();
+            if (!editor) { toast('未找到输入框', true, root); return; }
+            editor.focus();
+            api('/api/quick-phrase-insert', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ text: insertPhrase.text }),
+            }).then(function (result) {
+              if (!result || !result.ok) throw new Error((result && result.error) || 'daemon 未确认');
+              acMenuClose();
+            }).catch(function (error) { toast('插入失败: ' + (error.message || error), true, root); });
+          });
+          var sendKeyTarget = itemK.querySelector('.wbs-explore-it');
+          if (sendKeyTarget) sendKeyTarget.addEventListener('keydown', function (ev) {
+            if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); itemK.click(); }
+          });
           itemK.addEventListener('click', function (eve) {
             qpDiag('click:start', { phraseId: itemK.getAttribute('data-qp-send'), target: eve.target && eve.target.className || '' });
             eve.stopPropagation();
@@ -4672,11 +4899,20 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
       function position() {
         if (!root || !surface || !surface.viewportElement || hidden) return;
-        var rect = surface.viewportElement.getBoundingClientRect();
-        if (!rect || rect.width <= 0 || rect.height <= 0) {
+        var area = WBS_COMPAT.findConversationArea(document, surface.viewportElement);
+        var rect = area && area.rect;
+        // Measure the chat itself, not the window (sidebar and file preview
+        // may consume most of a wide window). Keep turns/settings for restore.
+        if (!rect || rect.width < 800) {
           root.style.display = 'none';
+          if (dragPointerId != null) finishNavDrag({ pointerId: dragPointerId }, true);
+          hideTooltip(true);
           return;
         }
+        var viewport = surface.viewportElement.getBoundingClientRect();
+        var top = Math.max(rect.top, viewport.top), bottom = Math.min(rect.bottom, viewport.bottom);
+        if (bottom <= top) { root.style.display = 'none'; hideTooltip(true); return; }
+        rect = { left:Math.max(rect.left, viewport.left), top:top, height:bottom-top };
         root.style.display = 'block';
         var railChrome = 14;
         var markerCount = Math.min(20, turns.length);
@@ -4801,16 +5037,21 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         if (!tooltip || tooltip.hidden || !anchorButton) return;
         var margin = 8, gap = 8;
         // 为右侧详情预留空间；窄窗口同时缩小两列，避免详情覆盖列表或超出视口。
+        var area = WBS_COMPAT.findConversationArea(document, surface && surface.viewportElement);
+        if (!area || !area.rect) { hideTooltip(true); return; }
+        var bounds = area.rect;
+        tooltip.style.maxHeight = Math.max(1, bounds.height - margin * 2) + 'px';
+        if (detail) detail.style.maxHeight = tooltip.style.maxHeight;
         var rootRect = root.getBoundingClientRect();
-        var left = Math.max(margin, Math.min(rootRect.right + gap, window.innerWidth - margin - 160));
-        var available = Math.max(0, window.innerWidth - left - margin - gap);
+        var left = Math.max(bounds.left + margin, Math.min(rootRect.right + gap, bounds.right - margin - 160));
+        var available = Math.max(0, bounds.right - left - margin - gap);
         var listWidth = Math.min(380, available * 0.46);
         var detailWidth = Math.min(440, available - listWidth);
         tooltip.style.width = listWidth + 'px';
         tooltip.style.left = left + 'px';
         var buttonRect = anchorButton.getBoundingClientRect();
         var height = tooltip.getBoundingClientRect().height;
-        tooltip.style.top = Math.max(margin, Math.min(window.innerHeight - height - margin,
+        tooltip.style.top = Math.max(bounds.top + margin, Math.min(bounds.bottom - height - margin,
           buttonRect.top + buttonRect.height / 2 - height / 2)) + 'px';
         if (!detail || detail.hidden || !previewRow) return;
         var rowRect = previewRow.getBoundingClientRect();
@@ -4818,7 +5059,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         if (rowRect.bottom <= listRect.top || rowRect.top >= listRect.bottom) { hideDetail(); return; }
         detail.style.width = detailWidth + 'px';
         detail.style.left = (left + listWidth + gap) + 'px';
-        detail.style.top = Math.max(margin, Math.min(window.innerHeight - detail.getBoundingClientRect().height - margin,
+        detail.style.top = Math.max(bounds.top + margin, Math.min(bounds.bottom - detail.getBoundingClientRect().height - margin,
           rowRect.top)) + 'px';
       }
 
@@ -5177,7 +5418,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         unbindStore();
         if (root) root.remove();
       });
-      return { sync: sync, setEnabled: setEnabled };
+      return { sync: sync, setEnabled: setEnabled, updateLayout: position };
     }
     var messageNavigation = createMessageNavigation();
     var forkBusy = false;
@@ -5412,12 +5653,6 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     // anchor is that element's bottom-right corner. Anchoring to the component
     // keeps the button beside the chat when the sidebar collapses, the window
     // resizes, or a right-hand detail panel opens.
-    var FAB_ANCHOR_SELECTORS = [
-      '.teams-container.is-mac .conversation-shell',
-      '.conversation-shell',
-      '.conversation-shell__main',
-      '.teams-main-content',
-    ];
     // v3 re-anchors the button to the conversation area. v2 stored a
     // viewport-relative bottom offset, which parked the robot mid-screen
     // (253px) even though it was asked to sit in the corner; that stale offset
@@ -5445,21 +5680,14 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
 
     function readFabAnchorNode() {
-      for (var i = 0; i < FAB_ANCHOR_SELECTORS.length; i++) {
-        var node = document.querySelector(FAB_ANCHOR_SELECTORS[i]);
-        if (!node) continue;
-        var rect = node.getBoundingClientRect();
-        if (rect && rect.width > 0 && rect.height > 0) return node;
-      }
-      return null;
+      var area = WBS_COMPAT.findConversationArea(document);
+      return area && area.element;
     }
 
-    // Distance from the viewport edges to the anchor's bottom-right corner plus
-    // the visual gap. Without a usable anchor the viewport corner is the floor.
     function fabAnchorOffsets() {
-      var node = readFabAnchorNode();
-      if (!node) return { right: FAB_EDGE_GAP, bottom: FAB_EDGE_GAP };
-      var rect = node.getBoundingClientRect();
+      var area = WBS_COMPAT.findConversationArea(document);
+      var rect = area && area.rect;
+      if (!rect) return { right:FAB_EDGE_GAP, bottom:FAB_EDGE_GAP };
       return {
         right: Math.max(FAB_EDGE_GAP, Math.round(window.innerWidth - rect.right) + FAB_EDGE_GAP),
         bottom: Math.max(FAB_EDGE_GAP, Math.round(window.innerHeight - rect.bottom) + FAB_EDGE_GAP),
@@ -5468,13 +5696,15 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
     function clampFabBottom(bottom, height) {
       var floor = fabAnchorOffsets().bottom;
-      var max = Math.max(floor, window.innerHeight - height - FAB_EDGE_GAP);
+      var area = WBS_COMPAT.findConversationArea(document);
+      var max = Math.max(floor, window.innerHeight - (area && area.rect ? area.rect.top : 0) - height - FAB_EDGE_GAP);
       return Math.max(floor, Math.min(max, Number(bottom) || floor));
     }
 
     function clampFabRight(right, width) {
       var floor = fabAnchorOffsets().right;
-      var max = Math.max(floor, window.innerWidth - width - FAB_EDGE_GAP);
+      var area = WBS_COMPAT.findConversationArea(document);
+      var max = Math.max(floor, window.innerWidth - (area && area.rect ? area.rect.left : 0) - width - FAB_EDGE_GAP);
       return Math.max(floor, Math.min(max, Number(right) || floor));
     }
 
@@ -5503,30 +5733,55 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     // switches, detail panel motion), so re-resolve the node and watch its box
     // instead of trusting the element captured at injection time.
     var fabAnchorObserver = null;
-    var fabAnchorObserverNode = null;
+    var fabLayoutObserver = null;
+    var fabObservedNodes = [];
     function ensureFabAnchorObserver() {
-      if (typeof ResizeObserver !== 'function') return;
-      var node = readFabAnchorNode();
-      if (node && node === fabAnchorObserverNode && node.isConnected) return;
+      var nodes = [], anchor = readFabAnchorNode();
+      var seeds = [anchor].concat(Array.from(document.querySelectorAll('.detail-panel-container')));
+      seeds.forEach(function (seed) {
+        for (var node = seed; node && node !== document.body; node = node.parentElement) {
+          if (nodes.indexOf(node) < 0) nodes.push(node);
+        }
+      });
+      if (nodes.length === fabObservedNodes.length && nodes.every(function (node, i) { return node === fabObservedNodes[i]; })) return;
       if (fabAnchorObserver) fabAnchorObserver.disconnect();
-      fabAnchorObserverNode = node;
-      if (!node) return;
-      if (!fabAnchorObserver) {
+      if (fabLayoutObserver) fabLayoutObserver.disconnect();
+      fabObservedNodes = nodes;
+      // Attributes are observed only on the layout ancestor chains, never on
+      // message descendants. Resize handles splitters/preview transitions;
+      // attributes handle visibility changes that keep the same dimensions.
+      if (!fabAnchorObserver && typeof ResizeObserver === 'function') {
         fabAnchorObserver = new ResizeObserver(function () { scheduleFabPos(); });
       }
-      fabAnchorObserver.observe(node);
+      if (!fabLayoutObserver && typeof MutationObserver === 'function') {
+        fabLayoutObserver = new MutationObserver(scheduleFabPos);
+      }
+      nodes.forEach(function (node) {
+        if (fabAnchorObserver) fabAnchorObserver.observe(node);
+        if (fabLayoutObserver) fabLayoutObserver.observe(node, { attributes:true, attributeFilter:['class','style','hidden'], subtree:false });
+      });
     }
     registerDisposer(function () {
-      if (!fabAnchorObserver) return;
-      fabAnchorObserver.disconnect();
+      if (fabAnchorObserver) fabAnchorObserver.disconnect();
+      if (fabLayoutObserver) fabLayoutObserver.disconnect();
       fabAnchorObserver = null;
-      fabAnchorObserverNode = null;
+      fabLayoutObserver = null;
+      fabObservedNodes = [];
     });
     function positionFab() {
       var fab = root.querySelector('.wbs-fab');
       if (!fab) return;
       ensureFabAnchorObserver();
-      if (fab.classList.contains('hidden')) return; // 面板打开时保持隐藏
+      var area = WBS_COMPAT.findConversationArea(document);
+      // 只有「会话区已挂载、却被整块遮住」（全屏文件/产物预览）才隐藏机器人。
+      // 1.2.21 把「没有会话区」也算成遮挡，于是首页（.wb-home-page）、设置、登录页
+      // 一律不显示机器人，必须切进任务才出现；更新前是常显的（issue #524）。
+      var areaHidden = !isWelcomePage() && !!(area && !area.rect);
+      var changed = fab.classList.contains('is-area-hidden') !== areaHidden;
+      fab.classList.toggle('is-area-hidden', areaHidden);
+      if (messageNavigation) messageNavigation.updateLayout();
+      if (changed && fabQuietMode) fabQuietMode.wake();
+      if (areaHidden || fab.classList.contains('hidden')) return;
       if (fabDrag) return;
       var anchor = fabAnchorOffsets();
       var saved = readFabBottom();
@@ -6716,7 +6971,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         '<span class="wbs-acct-stat-divider"></span>' +
         '<div class="wbs-acct-stat"><span>总积分</span><strong id="wbs-acct-total">-</strong></div>' +
         '<button class="wbs-acct-eye" type="button" data-act="credit-summary" title="汇总" aria-label="积分汇总" aria-expanded="false">' + CREDIT_SUMMARY_ICON + '</button>' +
-        '<button class="wbs-acct-eye" type="button" data-act="model-rate-limit-summary" title="模型限流" aria-label="模型限流" aria-expanded="false">' + MODEL_RATE_LIMIT_ICON + '</button>' +
+        '<button class="wbs-acct-eye" type="button" data-act="model-rate-limit-summary" title="模型限制" aria-label="模型限制" aria-expanded="false">' + MODEL_RATE_LIMIT_ICON + '</button>' +
         '</div>' +
         '<div class="wbs-acct-actions">' +
         '<button class="wbs-acct-io wbs-acct-icon" type="button" data-act="token-stats" title="用量统计" aria-label="用量统计">' + TOKEN_STATS_ICON + '</button>' +
@@ -8780,22 +9035,17 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         matches.sort(function (left, right) {
           return (Number(right.favoriteCount) || 0) - (Number(left.favoriteCount) || 0);
         });
-        var pageSize = 8;
-        var pages = Math.max(1, Math.ceil(matches.length / pageSize));
-        var page = mask.__wbsDiscoveryPage = Math.min(Math.max(1, mask.__wbsDiscoveryPage || 1), pages);
         mask.querySelector('.wbs-auto-discovery-total').textContent = favoritesOnly ? '我的收藏 ' + matches.length + ' 个' : '共 ' + tasks.length + ' 个任务' + (query.trim() ? ' · 匹配 ' + matches.length + ' 个' : '');
-        mask.querySelector('.wbs-auto-discovery-page').textContent = page + ' / ' + pages;
-        mask.querySelector('[data-auto-discovery-page="prev"]').disabled = page <= 1;
-        mask.querySelector('[data-auto-discovery-page="next"]').disabled = page >= pages;
         list.innerHTML = '';
         if (!matches.length) {
           var empty = document.createElement('div'); empty.className = 'wbs-auto-discovery-empty';
           empty.textContent = favoritesOnly && tasks.length ? '暂无收藏的任务' : tasks.length ? '没有匹配的任务' : (automationState.discoveryError || '暂未发现公开任务');
           list.appendChild(empty); return;
         }
-        matches.slice((page - 1) * pageSize, page * pageSize).forEach(function (task) {
+        matches.forEach(function (task, index) {
           var item = document.createElement('section'); item.className = 'wbs-auto-discovery-item';
-          item.innerHTML = '<div class="wbs-auto-discovery-head"><div class="wbs-auto-discovery-name" data-wbs-i18n-skip="1"></div><span class="wbs-auto-discovery-version"></span><span class="wbs-auto-discovery-update" hidden>新版</span><button class="wbs-auto-discovery-favorite" type="button" data-auto-discovery-favorite aria-label="收藏任务" title="收藏任务" aria-pressed="false">' + AUTO_FAVORITE_SVG + '<span data-auto-discovery-favorite-count>0</span></button></div><div class="wbs-auto-discovery-description" data-wbs-i18n-skip="1"></div><div class="wbs-auto-discovery-foot"><div class="wbs-auto-sources"></div><button class="wbs-modal-btn wbs-modal-ok" type="button" data-auto-discovery-import></button></div>';
+          item.innerHTML = '<div class="wbs-auto-discovery-head"><span class="wbs-auto-discovery-number"></span><div class="wbs-auto-discovery-name" data-wbs-i18n-skip="1"></div><span class="wbs-auto-discovery-version"></span><span class="wbs-auto-discovery-update" hidden>新版</span><button class="wbs-auto-discovery-favorite" type="button" data-auto-discovery-favorite aria-label="收藏任务" title="收藏任务" aria-pressed="false">' + AUTO_FAVORITE_SVG + '<span data-auto-discovery-favorite-count>0</span></button></div><div class="wbs-auto-discovery-description" data-wbs-i18n-skip="1"></div><div class="wbs-auto-discovery-foot"><div class="wbs-auto-sources"></div><button class="wbs-modal-btn wbs-modal-ok" type="button" data-auto-discovery-import></button></div>';
+          item.querySelector('.wbs-auto-discovery-number').textContent = String(index + 1);
           item.querySelector('.wbs-auto-discovery-name').textContent = task.name || '未命名任务';
           item.querySelector('.wbs-auto-discovery-version').textContent = task.packageVersion ? 'v' + task.packageVersion : 'API V' + (Number(task.schemaVersion) || 1);
           var installed = installedPackage(task.packageId);
@@ -8846,28 +9096,20 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       function showAutomationDiscovery() {
         closePanelModal(root.querySelector('#wbs-auto-discovery-mask'));
         var mask = document.createElement('div'); mask.id = 'wbs-auto-discovery-mask'; mask.className = 'wbs-modal-mask wbs-usage-modal-mask wbs-auto-dialog-mask';
-        mask.innerHTML = '<div class="wbs-modal wbs-token-stats-modal wbs-auto-discovery-modal" role="dialog" aria-modal="true" aria-labelledby="wbs-auto-discovery-title"><div class="wbs-usage-header wbs-auto-discovery-header"><div class="wbs-auto-modal-head"><div><div class="wbs-modal-title" id="wbs-auto-discovery-title">发现更多自动化任务</div><div class="wbs-auto-discovery-note">这些任务来自互联网公开仓库，均为第三方内容，与 WorkDaddy 无归属关系。导入后默认停用，请先安全评估再启用。</div><div class="wbs-auto-discovery-note wbs-auto-discovery-status" hidden>部分来源暂时无法访问，当前显示上次缓存的结果。</div></div><div class="wbs-auto-discovery-head-actions"><button class="wbs-auto-textbtn" type="button" data-auto-discovery-guide>我也要出现在这里</button><button class="wbs-auto-modal-close" type="button" data-auto-close title="关闭" aria-label="关闭"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3 3l10 10M13 3 3 13"/></svg></button></div></div><div class="wbs-auto-discovery-toolbar"><input class="wbs-auto-discovery-search" type="search" maxlength="120" aria-label="搜索任务名称" placeholder="搜索任务名称"><button class="wbs-auto-discovery-filter" type="button" data-auto-discovery-filter="favorites" aria-pressed="false">我的收藏</button></div></div><div class="wbs-usage-scroll wbs-auto-discovery-list"></div><div class="wbs-modal-actions wbs-auto-discovery-pagination"><span class="wbs-auto-discovery-total" role="status"></span><button class="wbs-modal-btn" type="button" data-auto-discovery-page="prev" aria-label="上一页">上一页</button><span class="wbs-auto-discovery-page"></span><button class="wbs-modal-btn" type="button" data-auto-discovery-page="next" aria-label="下一页">下一页</button></div></div>';
+        mask.innerHTML = '<div class="wbs-modal wbs-token-stats-modal wbs-auto-discovery-modal" role="dialog" aria-modal="true" aria-labelledby="wbs-auto-discovery-title"><div class="wbs-usage-header wbs-auto-discovery-header"><div class="wbs-auto-modal-head"><div><div class="wbs-modal-title" id="wbs-auto-discovery-title">发现更多自动化任务</div><div class="wbs-auto-discovery-note">这些任务来自互联网公开仓库，均为第三方内容，与 WorkDaddy 无归属关系。导入后默认停用，请先安全评估再启用。</div><div class="wbs-auto-discovery-note wbs-auto-discovery-status" hidden>部分来源暂时无法访问，当前显示上次缓存的结果。</div></div><div class="wbs-auto-discovery-head-actions"><button class="wbs-auto-textbtn" type="button" data-auto-discovery-guide>我也要出现在这里</button><button class="wbs-auto-modal-close" type="button" data-auto-close title="关闭" aria-label="关闭"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3 3l10 10M13 3 3 13"/></svg></button></div></div><div class="wbs-auto-discovery-toolbar"><input class="wbs-auto-discovery-search" type="search" maxlength="120" aria-label="搜索任务名称" placeholder="搜索任务名称"><button class="wbs-auto-discovery-filter" type="button" data-auto-discovery-filter="favorites" aria-pressed="false">我的收藏</button></div></div><div class="wbs-usage-scroll wbs-auto-discovery-list"></div><div class="wbs-modal-actions wbs-auto-discovery-footer"><span class="wbs-auto-discovery-total" role="status"></span></div></div>';
         mask.querySelector('.wbs-auto-discovery-status').hidden = !(automationState.discovery && automationState.discovery.stale);
         mountAutomationModal(mask);
         renderAutomationDiscovery(mask);
         var search = mask.querySelector('.wbs-auto-discovery-search');
-        search.addEventListener('input', function () { mask.__wbsDiscoveryPage = 1; renderAutomationDiscovery(mask); mask.querySelector('.wbs-auto-discovery-list').scrollTop = 0; });
+        search.addEventListener('input', function () { renderAutomationDiscovery(mask); mask.querySelector('.wbs-auto-discovery-list').scrollTop = 0; });
         mask.querySelector('[data-auto-discovery-filter="favorites"]').addEventListener('click', function (event) {
           mask.__wbsDiscoveryFavoritesOnly = !mask.__wbsDiscoveryFavoritesOnly;
           event.currentTarget.setAttribute('aria-pressed', String(mask.__wbsDiscoveryFavoritesOnly));
           event.currentTarget.classList.toggle('active', mask.__wbsDiscoveryFavoritesOnly);
-          mask.__wbsDiscoveryPage = 1;
           renderAutomationDiscovery(mask);
           mask.querySelector('.wbs-auto-discovery-list').scrollTop = 0;
         });
         mask.querySelector('[data-auto-discovery-guide]').addEventListener('click', showAutomationDiscoveryGuide);
-        mask.querySelector('.wbs-auto-discovery-pagination').addEventListener('click', function (event) {
-          var button = event.target.closest && event.target.closest('[data-auto-discovery-page]');
-          if (!button || button.disabled) return;
-          mask.__wbsDiscoveryPage += button.getAttribute('data-auto-discovery-page') === 'next' ? 1 : -1;
-          renderAutomationDiscovery(mask);
-          mask.querySelector('.wbs-auto-discovery-list').scrollTop = 0;
-        });
         mask.querySelector('.wbs-auto-discovery-list').addEventListener('click', function (event) {
           var favoriteButton = event.target.closest && event.target.closest('[data-auto-discovery-favorite]');
           if (favoriteButton) {
@@ -9309,7 +9551,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       else if (job.status === 'done') detail += ' · 新同步 ' + (Number(job.copied) || 0) + '，已存在 ' + (Number(job.skipped) || 0);
       else if (job.status === 'conflict') detail += ' · ' + (Number(job.conflicts) || 1) + ' 个会话已分叉，已保留双方内容';
       else if (job.status === 'partial') detail += ' · 有 ' + ((Number(job.failed) || 0) + (Number(job.partial) || 0)) + ' 项需要留意';
-      else if (job.status === 'error') detail += ' · 请稍后重试';
+      else if (job.status === 'error') detail += ' · ' + (job.error || '同步任务异常中断，请稍后重新同步');
       if (job.warning) detail += ' · ' + job.warning;
       box.className = 'wbs-sess-copy-progress is-' + String(job.status || 'running');
       box.querySelector('.wbs-sess-copy-title').textContent = title;
@@ -10266,21 +10508,45 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     // 删除弹窗：确认框（真实删除，弹窗内警示不可恢复）
     function openDeleteModal(ids, allAccounts) {
       ids = ids.slice();
+      var scope = allAccounts ? 'lineage' : 'selected';
       var titleEl = sessionsPane.querySelector('#wbs-sess-modal-title');
       var body = sessionsPane.querySelector('#wbs-sess-modal-body');
       var okBtn = sessionsPane.querySelector('#wbs-sess-modal-ok');
       var cancelBtn = sessionsPane.querySelector('#wbs-sess-modal-cancel');
       var confirmed = !allAccounts;
       var pending = false;
+      var previewToken = null;
       titleEl.textContent = allAccounts ? '删除所有账号的同源会话？' : '删除 ' + ids.length + ' 个会话？';
-      body.innerHTML = allAccounts
-        ? '<p>已选 ' + ids.length + ' 个会话</p><div class="wbs-modal-warn">将永久删除所选会话，以及已关联到其他账号的所有同步副本、消息文件和本地缓存。此操作不可恢复。</div>'
-        : '<div class="wbs-modal-warn">删除后会话将从列表中移除，本账号的会话及同步到其他账号的同源会话（本地消息文件）都将被永久删除，此操作不可恢复。</div>';
       okBtn.textContent = allAccounts ? '继续确认' : '确定';
-      okBtn.disabled = false;
+      okBtn.disabled = true;
+      okBtn.classList.remove('is-loading');
+      okBtn.removeAttribute('aria-busy');
       showSessModal(true);
+      function loadDeletePreview() {
+        previewToken = null;
+        confirmed = !allAccounts;
+        titleEl.textContent = allAccounts ? '删除所有账号的同源会话？' : '删除 ' + ids.length + ' 个会话？';
+        okBtn.disabled = true;
+        okBtn.textContent = allAccounts ? '继续确认' : '确定';
+        body.textContent = '正在核对删除范围…';
+        api('/api/sessions/delete', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ ids: ids, scope: scope, preview: true }),
+        }).then(function (data) {
+          if (okBtn.onclick !== submit) return;
+          previewToken = data.previewToken;
+          body.textContent = '将删除 ' + data.total + ' 个会话，涉及 ' + data.accounts + ' 个账号。' +
+            (allAccounts ? '包含所选会话及其所有已关联副本，删除无法撤销。' :
+              '仅删除所选会话，保留其他副本。自动同步不会在这些账号重新生成已删除的副本；如需恢复，可手动同步。删除无法撤销。');
+          okBtn.disabled = !previewToken || !data.total;
+        }).catch(function (error) {
+          if (okBtn.onclick !== submit) return;
+          body.textContent = '无法核对删除范围，请关闭后重试。';
+          toast('删除失败: ' + (error.message || error), true, root);
+        });
+      }
       var submit = function () {
-        if (pending) return;
+        if (pending || !previewToken || okBtn.disabled) return;
         if (!confirmed) {
           confirmed = true;
           titleEl.textContent = '再次确认永久删除';
@@ -10290,32 +10556,30 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         }
         pending = true;
         okBtn.disabled = true;
-        var pendingLabel = okBtn.textContent;
         okBtn.textContent = '删除中…';
         okBtn.classList.add('is-loading');
         okBtn.setAttribute('aria-busy', 'true');
         api('/api/sessions/delete', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ ids: ids }),
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ ids: ids, scope: scope, previewToken: previewToken }),
         }).then(function (d) {
-          var extra = (d && d.cascaded) ? '，含其他账号副本 ' + d.cascaded + ' 个' : '';
+          var extra = (d && d.cascaded) ? '，含关联副本 ' + d.cascaded + ' 个' : '';
           toast('已删除 ' + ((d && typeof d.deleted === 'number') ? d.deleted : ids.length) + ' 个会话' + extra, false, root);
           if (okBtn.onclick === submit) showSessModal(false);
           loadSessions();
-        }).catch(function (e) {
-          toast('删除失败: ' + (e.message || e), true, root);
+        }).catch(function (error) {
+          toast('删除失败: ' + (error.message || error), true, root);
+          if (okBtn.onclick === submit) loadDeletePreview();
         }).finally(function () {
           pending = false;
           if (okBtn.onclick === submit) {
-            okBtn.disabled = false;
-            okBtn.textContent = pendingLabel;
             okBtn.classList.remove('is-loading');
             okBtn.removeAttribute('aria-busy');
           }
         });
       };
       okBtn.onclick = submit;
+      loadDeletePreview();
       cancelBtn.focus();
     }
     function selectedSessIds() {
@@ -11170,6 +11434,14 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
             '<div class="wbs-pcard-sub" id="wbs-rendering-help">关闭硬件加速并使用软件渲染，可能降低性能。保存后请完全退出 WorkBuddy AI，再通过 WorkDaddy AI 启动；关闭此开关可恢复默认。</div>' +
             '<div class="wbs-pcard-sub" id="wbs-rendering-status" role="status" aria-live="polite">正在读取设置…</div>' +
           '</div>' : '') +
+        (WBS_PLATFORM === 'win32' && (WBS_PROFILE_IS_AI || PROFILE_ID === 'workbuddy-cn') ?
+          '<div class="wbs-pcard wbs-settings-card wbs-client-temp-card" id="wbs-client-temp-card">' +
+            '<div class="wbs-settings-row"><span class="wbs-pcard-title">客户端临时文件</span></div>' +
+            '<div class="wbs-pcard-sub">仅清理当前客户端 7 天未修改的临时项目，保留近期文件和官方更新缓存。请先保存需要的临时产物并结束任务。</div>' +
+            '<div class="wbs-pcard-sub" id="wbs-client-temp-status" role="status" aria-live="polite">点击统计查看占用</div>' +
+            '<div class="wbs-client-temp-actions"><button type="button" class="wbs-modal-btn" id="wbs-client-temp-scan">统计占用</button>' +
+              '<button type="button" class="wbs-modal-btn" id="wbs-client-temp-clean" disabled>下次启动清理</button></div>' +
+          '</div>' : '') +
         '<div class="wbs-pcard wbs-telemetry-card" id="wbs-telemetry-card">' +
           '<div class="wbs-telemetry-head">' +
             '<div class="wbs-telemetry-label"><span class="wbs-pcard-title">发送错误诊断</span><span class="wbs-telemetry-help" tabindex="0" aria-label="查看错误诊断说明"><svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="8"/><path d="M8.4 7.6a1.8 1.8 0 1 1 2.8 1.45c-.75.48-1.2.85-1.2 1.75M10 13.7v.1"/></svg><span class="wbs-telemetry-tooltip" role="tooltip">此开关控制脱敏错误诊断。匿名安装数和日活独立统计（随机安装标识、系统、架构、版本、客户端类型及出口国家），不受此开关影响。不包含账号、会话内容、Token 或 API Key。</span></span></div>' +
@@ -11233,9 +11505,82 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       }
       wireTelemetrySettings();
       wireClientLaunchSettings();
+      wireClientTempCleanup();
       acRenderMonitorLogModal();
       // 自动更新：检查 + 红点 + 更新卡片
       checkForUpdate();
+    }
+
+    function wireClientTempCleanup() {
+      var card = aboutPane.querySelector('#wbs-client-temp-card');
+      if (!card) return;
+      var status = card.querySelector('#wbs-client-temp-status');
+      var scan = card.querySelector('#wbs-client-temp-scan');
+      var clean = card.querySelector('#wbs-client-temp-clean');
+      var pending = false;
+      var mask = null;
+      function size(bytes) { return (Math.max(0, Number(bytes) || 0) / 1048576).toFixed(1) + ' MB'; }
+      function renderClientTempStatus(data) {
+        if (!data.supported) { card.style.display = 'none'; return; }
+        pending = data.pending === true;
+        clean.textContent = pending ? '取消清理' : '下次启动清理';
+        clean.disabled = false;
+        status.textContent = pending ? '已安排：完全退出客户端并结束相关任务后，通过 ' + WBS_BRAND + ' 再次启动时清理。' :
+          '占用 ' + size(data.bytes) + ' · 可清理 ' + size(data.cleanableBytes) + (data.incomplete ? '（统计不完整，无法读取的项目将保留）' : '');
+        if (!pending && data.lastResult) status.textContent += ' · 上次已清理 ' + size(data.lastResult.removedBytes) +
+          (data.lastResult.skippedEntries || data.lastResult.incomplete ? '（部分项目已跳过）' : '');
+      }
+      function refreshClientTempStats() {
+        scan.disabled = true; clean.disabled = true; status.textContent = '正在统计临时文件…';
+        return api('/api/client-temp').then(renderClientTempStatus).catch(function (error) {
+          status.textContent = error.message || '统计失败，请重试';
+        }).finally(function () { scan.disabled = false; });
+      }
+      function save(next) {
+        clean.disabled = true;
+        api('/api/client-temp', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pending: next }) })
+          .then(function (data) {
+            pending = data.pending === true;
+            if (pending) renderClientTempStatus(data); else refreshClientTempStats();
+          }).catch(function (error) { status.textContent = error.message || '保存失败，请重试'; clean.disabled = false; });
+      }
+      function close() { if (mask) { mask.remove(); mask = null; clean.focus(); } }
+      scan.addEventListener('click', refreshClientTempStats);
+      clean.addEventListener('click', function () {
+        if (pending) { save(false); return; }
+        if (mask) return;
+        mask = document.createElement('div');
+        mask.className = 'wbs-modal-mask wbs-client-temp-mask';
+        mask.innerHTML = '<div class="wbs-modal" role="dialog" aria-modal="true" aria-labelledby="wbs-client-temp-title">' +
+          '<div class="wbs-modal-title" id="wbs-client-temp-title">安排清理临时文件？</div>' +
+          '<div class="wbs-modal-body">清理无法撤销。请保存需要的临时产物，完全退出客户端并结束相关任务，再通过 WorkDaddy 启动。仅处理 7 天未修改的临时项目，保留官方更新缓存；账号备份和正式会话目录不在清理范围内。</div>' +
+          '<div class="wbs-modal-actions"><button type="button" class="wbs-modal-btn" data-temp-action="cancel">取消</button>' +
+          '<button type="button" class="wbs-modal-btn wbs-modal-ok" data-temp-action="confirm">安排清理</button></div></div>';
+        mask.querySelector('.wbs-modal-body').textContent = mask.querySelector('.wbs-modal-body').textContent.replace('WorkDaddy', WBS_BRAND);
+        ['pointerdown', 'mousedown', 'mouseup', 'pointerup', 'wheel'].forEach(function (name) {
+          mask.addEventListener(name, function (event) { event.stopPropagation(); });
+        });
+        mask.addEventListener('click', function (event) {
+          event.stopPropagation();
+          var action = event.target.getAttribute && event.target.getAttribute('data-temp-action');
+          if (event.target === mask || action === 'cancel') close();
+          else if (action === 'confirm') { close(); save(true); }
+        });
+        mask.addEventListener('keydown', function (event) {
+          event.stopPropagation();
+          if (event.key === 'Escape') { event.preventDefault(); close(); }
+          else if (event.key === 'Tab') {
+            var buttons = mask.querySelectorAll('button');
+            if ((event.shiftKey && document.activeElement === buttons[0]) || (!event.shiftKey && document.activeElement === buttons[1])) {
+              event.preventDefault(); buttons[event.shiftKey ? 1 : 0].focus();
+            }
+          }
+        });
+        root.appendChild(mask);
+        applyI18n(mask);
+        mask.querySelector('button').focus();
+      });
+      registerDisposer(close);
     }
 
     function wireClientLaunchSettings() {
@@ -12224,6 +12569,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       fab: fab, window: window, document: document, listen: listen,
       storage: localStorage, settingKey: 'wbs-fab-auto-dock-' + PROFILE_ID,
       isDragging: function () { return !!fabDrag; },
+      rightEdge: function () {
+        var area = WBS_COMPAT.findConversationArea(document);
+        return area && area.rect ? area.rect.right : window.innerWidth;
+      },
     });
     registerDisposer(fabQuietMode.destroy);
     setupFabDrag();
@@ -13341,20 +13690,20 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
 
     function acNotifyLimit(snapshot) {
-      if (!snapshot || (!snapshot.rateLimited && !snapshot.quotaExhausted)) return;
-      var reason = snapshot.rateLimited ? 'model-rate-limited' : 'quota-exhausted';
+      if (!snapshot || (!snapshot.rateLimited && !snapshot.usageLimited && !snapshot.quotaExhausted)) return;
+      var reason = snapshot.rateLimited ? 'model-rate-limited' : (snapshot.usageLimited ? 'model-usage-limited' : 'quota-exhausted');
       var key = [snapshot.conversationId || '', snapshot.assistantId || '', reason, snapshot.errorResetAt || ''].join('|');
       if (acLimitToastSeen[key]) return;
       acLimitToastSeen[key] = true;
       var message = wbsTranslateString(
-        snapshot.rateLimited ? '当前模型已触发频率限制，已停止自动发送' : '当前账号积分已耗尽',
+        snapshot.rateLimited ? '当前模型已触发频率限制，已停止自动发送' : (snapshot.usageLimited ? '当前模型用量已达限制，已停止自动发送' : '当前账号积分已耗尽'),
         WBS_LANGUAGE
       );
-      if (snapshot.rateLimited) {
+      if (snapshot.rateLimited || snapshot.usageLimited) {
         var model = String(snapshot.errorModelName || snapshot.errorRequestModelId || '').trim();
         if (model) message += '，' + wbsTranslateString('模型：', WBS_LANGUAGE) + model;
         if (snapshot.errorResetAt) {
-          message += '，' + wbsTranslateString('预计解封：', WBS_LANGUAGE) + fmtDateTime(snapshot.errorResetAt);
+          message += '，' + wbsTranslateString(snapshot.usageLimited ? '预计恢复：' : '预计解封：', WBS_LANGUAGE) + fmtDateTime(snapshot.errorResetAt);
         }
       }
       toast(message, true, root);
@@ -13823,9 +14172,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
 
     function acRecordModelRateLimit(snapshot) {
-      if (!snapshot || !snapshot.rateLimited || Number(snapshot.errorCode) !== 6004) return;
-      var modelId = String(snapshot.errorRequestModelId || 'unknown-model').slice(0, 160);
+      if (!snapshot) return;
       var code = Number(snapshot.errorCode);
+      if ((code !== 6000 && code !== 6004) || (code === 6004 && !snapshot.rateLimited) ||
+          (code === 6000 && snapshot.limitType !== 'usage')) return;
+      var modelId = String(snapshot.errorRequestModelId || 'unknown-model').slice(0, 160);
       var signature = [snapshot.conversationId, snapshot.assistantId, modelId, code, snapshot.errorResetAt || ''].join('|');
       if (acRateLimitRecorded[signature]) return;
       acRateLimitRecorded[signature] = 'pending';
@@ -13843,7 +14194,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
             modelId: modelId,
             modelName: snapshot.errorModelName || modelId,
             resetAt: snapshot.errorResetAt || null,
-            reasonCode: 6004,
+            reasonCode: code,
             source: 'renderer-error',
           }),
         }).then(function () {
@@ -13894,6 +14245,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           errorModelName: modelId,
           errorResetAt: normalizedError && normalizedError.resetAt,
           quotaExhausted: !!(normalizedError && normalizedError.quotaExhausted),
+          usageLimited: !!(normalizedError && normalizedError.usageLimited),
           rateLimited: !!(normalizedError && normalizedError.rateLimited),
           authFailure: !!(normalizedError && normalizedError.authFailure),
           nonRetryableError: !!(normalizedError && normalizedError.nonRetryable),
@@ -15868,13 +16220,45 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       return tag ? '<span class="wbs-checkin-slot">' + tag + '</span>' : '';
     }
 
+    // 「今日是否已派猫」只取官方 /travel/status 的当日配额与行程状态。
+    // 领取可能跨天，「今天领过奖」与「今天派过猫」不是同一个问题，这里不做领取日推断。
+    // 数据来自 fetchDailyProgressForAccounts() 已有的批量快照，本函数不发起任何请求。
+    function isTodayBeijing(ts) {
+      var value = Number(ts);
+      if (!isFinite(value) || value <= 0) return false;
+      var offset = 8 * 3600000;
+      return new Date(value + offset).toISOString().slice(0, 10) === new Date(Date.now() + offset).toISOString().slice(0, 10);
+    }
+
+    function travelBadgeHtml(a) {
+      if (WBS_PROFILE_IS_AI || CAPS.growthDaily === false) return '';
+      var progress = a && a.dailyProgress;
+      if (!progress || progress.status !== 'ready' || !isTodayBeijing(progress.fetchedAt)) return '';
+      var cat = progress.cat || {};
+      if (cat.available === false || cat.state === 'locked' || cat.state === 'unknown') return '';
+      var sent = cat.dailyLimitReached === true || cat.state === 'traveling' || cat.state === 'arrived';
+      var label = wbsTranslateString(sent ? '今日已派猫' : '今日未派猫', WBS_LANGUAGE);
+      return '<span class="wbs-travel-slot"><span class="wbs-ck wbs-checkin-tag ' + (sent ? 'ok' : 'pending') + '" title="' + escAttr(label) + '">' + esc(label) + '</span></span>';
+    }
+
+    function modelLimitKind(record) {
+      return Number(record && record.reasonCode) === 6000
+        ? wbsTranslateString('用量限制', WBS_LANGUAGE)
+        : wbsTranslateString('频率限制', WBS_LANGUAGE);
+    }
+
+    function modelLimitResetLabel(record, unknown) {
+      var key = Number(record && record.reasonCode) === 6000 ? '预计恢复' : '预计解封';
+      return wbsTranslateString(key + (unknown ? '：时间未知' : '：'), WBS_LANGUAGE);
+    }
+
     function modelRateLimitTip(record) {
       var name = String(record && (record.modelName || record.modelId) || '未知模型');
       var reset = record && record.resetAt ? Number(record.resetAt) : 0;
       var line = reset && isFinite(reset)
-        ? wbsTranslateString('预计解封：', WBS_LANGUAGE) + fmtDateTimeSeconds(reset) + '（' + wbsTranslateString(fmtCreditExpiry(reset), WBS_LANGUAGE) + '）'
-        : wbsTranslateString('预计解封：时间未知', WBS_LANGUAGE);
-      return name + '\n' + line;
+        ? modelLimitResetLabel(record, false) + fmtDateTimeSeconds(reset) + '（' + wbsTranslateString(fmtCreditExpiry(reset), WBS_LANGUAGE) + '）'
+        : modelLimitResetLabel(record, true);
+      return name + '\n' + modelLimitKind(record) + '\n' + line;
     }
 
     function modelRateLimitBadgeHtml(a) {
@@ -15883,7 +16267,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       }) : [];
       if (!records.length) return '';
       var details = records.map(modelRateLimitTip).join('\n\n');
-      var label = records.length === 1 ? wbsTranslateString('模型限流', WBS_LANGUAGE) : wbsTranslateString('模型限流·', WBS_LANGUAGE) + records.length;
+      var label = records.length === 1 ? wbsTranslateString('模型限制', WBS_LANGUAGE) : wbsTranslateString('模型限制·', WBS_LANGUAGE) + records.length;
       var attr = esc(details).replace(/"/g, '&quot;');
       var uid = escAttr(a && a.uid || '');
       return '<span class="wbs-model-rate-limit-slot"><button type="button" class="wbs-model-rate-limit wbs-ck wbs-checkin-tag ok" data-uid="' + uid + '" aria-label="' + attr + '" aria-controls="wbs-status-popover" aria-expanded="false">' + esc(label) + '</button></span>';
@@ -15899,11 +16283,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var resetText = reset && isFinite(reset) ? fmtDateTimeSeconds(reset) : wbsTranslateString('时间未知', WBS_LANGUAGE);
         var remaining = reset && isFinite(reset) ? '（' + wbsTranslateString(fmtCreditExpiry(reset), WBS_LANGUAGE) + '）' : '';
         return '<div class="wbs-daily-detail wbs-model-rate-limit-detail"><i class="rate-limit"></i>' +
-          '<span>' + wbsTranslateString('模型限流', WBS_LANGUAGE) + '</span><b class="wbs-model-rate-limit-model">' + esc(name) + '</b>' +
-          '<span>' + wbsTranslateString('预计解封', WBS_LANGUAGE) + '</span><b class="wbs-model-rate-limit-reset">' + esc(resetText + remaining) + '</b></div>';
+          '<span>' + modelLimitKind(record) + '</span><b class="wbs-model-rate-limit-model">' + esc(name) + '</b>' +
+          '<span>' + modelLimitResetLabel(record, !reset) + '</span><b class="wbs-model-rate-limit-reset">' + esc(reset ? resetText + remaining : wbsTranslateString('时间未知', WBS_LANGUAGE)) + '</b></div>';
       }).join('');
-      return '<div class="wbs-daily-popover-head"><strong>' + wbsTranslateString('模型频率限制', WBS_LANGUAGE) + '</strong><span>' + wbsTranslateString('账号状态', WBS_LANGUAGE) + '</span></div>' +
-        (rows || '<div class="wbs-daily-popover-empty">' + wbsTranslateString('当前没有有效的模型限流记录', WBS_LANGUAGE) + '</div>');
+      return '<div class="wbs-daily-popover-head"><strong>' + wbsTranslateString('模型限制', WBS_LANGUAGE) + '</strong><span>' + wbsTranslateString('账号状态', WBS_LANGUAGE) + '</span></div>' +
+        (rows || '<div class="wbs-daily-popover-empty">' + wbsTranslateString('当前没有有效的模型限制记录', WBS_LANGUAGE) + '</div>');
     }
 
     function modelRateLimitSummaryPopoverHtml(accounts) {
@@ -15917,14 +16301,15 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var rows = records.map(function (record) {
           var name = String(record.modelName || record.modelId || '未知模型');
           var reset = record.resetAt ? Number(record.resetAt) : 0;
+          var hasReset = !!reset && isFinite(reset);
           var resetText = reset && isFinite(reset) ? fmtDateTimeSeconds(reset) : wbsTranslateString('时间未知', WBS_LANGUAGE);
           var remaining = reset && isFinite(reset) ? '（' + wbsTranslateString(fmtCreditExpiry(reset), WBS_LANGUAGE) + '）' : '';
-          return '<div class="wbs-model-rate-limit-summary-row"><b class="wbs-model-rate-limit-model">' + esc(name) + '</b><span class="wbs-model-rate-limit-reset-label">' + wbsTranslateString('预计解封', WBS_LANGUAGE) + '</span><b class="wbs-model-rate-limit-reset">' + esc(resetText + remaining) + '</b></div>';
+          return '<div class="wbs-model-rate-limit-summary-row"><b class="wbs-model-rate-limit-model">' + esc(name) + '</b><span>' + modelLimitKind(record) + '</span><span class="wbs-model-rate-limit-reset-label">' + modelLimitResetLabel(record, false) + '</span><b class="wbs-model-rate-limit-reset">' + esc(hasReset ? resetText + remaining : wbsTranslateString('时间未知', WBS_LANGUAGE)) + '</b></div>';
         }).join('');
         groups.push('<section class="wbs-model-rate-limit-account-group"><div class="wbs-model-rate-limit-account-head"><strong>' + esc(accountName) + '</strong><span>' + records.length + wbsTranslateString(' 个模型', WBS_LANGUAGE) + '</span></div>' + rows + '</section>');
       });
-      return '<div class="wbs-daily-popover-head"><strong>' + wbsTranslateString('模型频率限制', WBS_LANGUAGE) + '</strong><span>' + wbsTranslateString('{n} 个账号', WBS_LANGUAGE).replace('{n}', groups.length) + '</span></div>' +
-        (groups.join('') || '<div class="wbs-daily-popover-empty">' + wbsTranslateString('当前没有有效的模型限流记录', WBS_LANGUAGE) + '</div>');
+      return '<div class="wbs-daily-popover-head"><strong>' + wbsTranslateString('模型限制', WBS_LANGUAGE) + '</strong><span>' + wbsTranslateString('{n} 个账号', WBS_LANGUAGE).replace('{n}', groups.length) + '</span></div>' +
+        (groups.join('') || '<div class="wbs-daily-popover-empty">' + wbsTranslateString('当前没有有效的模型限制记录', WBS_LANGUAGE) + '</div>');
     }
 
     function creditBlockHtml(credits, segments, account) {
@@ -16225,16 +16610,27 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var uid = cards[i].getAttribute('data-uid');
         var account = state.accounts.filter(function (item) { return String(item.uid) === String(uid); })[0];
         if (!account) continue;
+        var nameGroup = cards[i].querySelector('.wbs-name-group');
         var existing = cards[i].querySelector('.wbs-daily-rings');
         if (existing) {
           existing.setAttribute('aria-label', dailyProgressLabel(account.dailyProgress));
           existing.innerHTML = dailyRingsSvg(account) + activityStreakHtml(account);
         }
-        else {
-          var nameGroup = cards[i].querySelector('.wbs-name-group');
-          var checkinSlot = nameGroup && nameGroup.querySelector('.wbs-checkin-slot');
+        else if (nameGroup) {
+          var checkinSlot = nameGroup.querySelector('.wbs-checkin-slot');
           if (checkinSlot) checkinSlot.insertAdjacentHTML('beforebegin', dailyRingsHtml(account));
-          else if (nameGroup) nameGroup.insertAdjacentHTML('beforeend', dailyRingsHtml(account));
+          else nameGroup.insertAdjacentHTML('beforeend', dailyRingsHtml(account));
+        }
+        // 派猫徽章依赖异步到达的 dailyProgress，随成长数据一起局部刷新。
+        var travelSlot = nameGroup && nameGroup.querySelector('.wbs-travel-slot');
+        var travelBadge = typeof travelBadgeHtml === 'function' ? travelBadgeHtml(account) : '';
+        if (travelSlot) {
+          if (travelBadge) travelSlot.outerHTML = travelBadge;
+          else travelSlot.remove();
+        } else if (travelBadge && nameGroup) {
+          var checkinSlotAfter = nameGroup.querySelector('.wbs-checkin-slot');
+          if (checkinSlotAfter) checkinSlotAfter.insertAdjacentHTML('afterend', travelBadge);
+          else nameGroup.insertAdjacentHTML('beforeend', travelBadge);
         }
       }
     }
@@ -16341,7 +16737,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
     function sessionCopySummaryText(job) {
       return '同步 ' + (Number(job && job.copied) || 0) +
-        ' · 失败 ' + (sessionCopyFailedItems(job) + (Number(job && job.conflicts) || 0)) +
+        (job && job.status === 'error' ? ' · 任务失败' : ' · 失败 ' + (sessionCopyFailedItems(job) + (Number(job && job.conflicts) || 0))) +
         (job && job.warning ? ' · ' + job.warning : '');
     }
 
@@ -16351,7 +16747,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
 
     function sessionCopyNoticeGroups(job) {
-      var details = Array.isArray(job && job.details) ? job.details : [];
+      var details = Array.isArray(job && job.details) ? job.details.slice() : [];
+      if (job && job.status === 'error') details.push({ status: 'failed', label: '同步任务', error: job.error || '同步任务异常中断，请稍后重新同步', taskFailure: true });
       return {
         copied: details.filter(function (item) {
           return String(item && item.status || '') === 'copied';
@@ -16416,7 +16813,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var mask = document.createElement('div');
       mask.className = 'wbs-modal-mask wbs-session-copy-details-modal';
       mask.setAttribute('role', 'presentation');
-      var details = Array.isArray(job.details) ? job.details : [];
+      var groups = sessionCopyNoticeGroups(job);
+      var details = groups.copied.concat(groups.failed);
       var statusLabels = { copied: '已同步', skipped: '已跳过', partial: '部分失败', failed: '失败', conflict: '未同步', running: '处理中' };
       var tabDefs = [
         { id: 'copied', label: '成功', count: details.filter(function (item) { return item && item.status === 'copied'; }).length },
@@ -16457,7 +16855,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           tab.setAttribute('aria-selected', active ? 'true' : 'false');
         });
       };
-      renderTab('copied');
+      renderTab(job.status === 'error' ? 'failed' : 'copied');
       mask.querySelectorAll('[data-session-copy-tab]').forEach(function (tab) {
         tab.addEventListener('click', function () { renderTab(tab.getAttribute('data-session-copy-tab')); });
       });
@@ -16526,7 +16924,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var sourceLabel = sessionCopyAccountLabel(job.sourceUid, job.sourceName);
       var targetLabel = accountName || sessionCopyAccountLabel(job.targetUid, job.targetName);
       var status = active ? '正在把已标记的会话从「' + sourceLabel + '」同步到「' + targetLabel + '」' :
-        job.status === 'error' ? '同步任务未完成，请稍后重试' : '';
+        job.status === 'error' ? (job.error || '同步任务异常中断，请稍后重新同步') : '';
       node.className = 'wbs-session-copy-notice is-' + String(job.status || 'running');
       node.querySelector('.wbs-session-copy-title').textContent = title;
       node.querySelector('.wbs-session-copy-route').textContent = sourceLabel + ' → ' + targetLabel;
@@ -16552,7 +16950,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       track.setAttribute('aria-valuetext', title + '，' + processed + '/' + total);
       node.querySelector('.wbs-session-copy-fill').style.width = percent + '%';
       placeSessionCopyNotice();
-      if (!active && !notice.closeScheduled) {
+      if (job.status === 'error') node.querySelector('.wbs-session-copy-countdown').textContent = '请查看明细';
+      if (!active && job.status !== 'error' && !notice.closeScheduled) {
         notice.closeScheduled = true;
         var copiedCount = Math.max(0, Number(job && job.copied) || 0);
         var failedCount = sessionCopyFailedItems(job) + (Number(job && job.conflicts) || 0);
@@ -16820,6 +17219,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var editionBadge = a.type === 'personal' ? '个人版' : (a.enterpriseName ? a.enterpriseName : (a.type ? '企业' : ''));
         var badge = editionBadge ? '<span class="wbs-badge">' + esc(editionBadge) + '</span>' : '';
         var checkinBadge = checkinBadgeHtml(a);
+        var travelBadge = typeof travelBadgeHtml === 'function' ? travelBadgeHtml(a) : '';
         var modelRateLimitBadge = typeof modelRateLimitBadgeHtml === 'function' ? modelRateLimitBadgeHtml(a) : '';
         var invalidAuthBadge = a.authValid === false ? '<span class="wbs-badge wbs-auth-invalid">认证数据无效</span>' : '';
         // 过期账号仍可手动切换检查登录状态；仅损坏的认证备份禁止切换。
@@ -16839,7 +17239,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var idVal = accountDisplayId(a, state.mask);
         card.innerHTML =
           '<div class="wbs-info">' +
-          '<div class="wbs-row1"><div class="wbs-name-group"><button type="button" class="wbs-account-name" data-uid="' + escAttr(a.uid) + '" aria-label="查看或编辑账号备注" aria-haspopup="dialog" aria-controls="wbs-account-note-popover" aria-expanded="false"><span class="wbs-name">' + esc(nameVal) + '</span><span class="wbs-account-name-edit" aria-hidden="true">' + MODEL_EDIT_SVG + '</span></button>' + badge + dailyRingsHtml(a) + checkinBadge + modelRateLimitBadge + invalidAuthBadge + '</div>' + ops + '</div>' +
+          '<div class="wbs-row1"><div class="wbs-name-group"><button type="button" class="wbs-account-name" data-uid="' + escAttr(a.uid) + '" aria-label="查看或编辑账号备注" aria-haspopup="dialog" aria-controls="wbs-account-note-popover" aria-expanded="false"><span class="wbs-name">' + esc(nameVal) + '</span><span class="wbs-account-name-edit" aria-hidden="true">' + MODEL_EDIT_SVG + '</span></button>' + badge + dailyRingsHtml(a) + checkinBadge + travelBadge + modelRateLimitBadge + invalidAuthBadge + '</div>' + ops + '</div>' +
           '<div class="wbs-meta wbs-secondary-row">' +
           '<div class="wbs-mi wbs-phone-cell' + (isUinMode ? ' wbs-uin-cell' : '') + '"><span class="wbs-lbl">' + idLbl + '</span><span class="wbs-val">' + esc(idVal) + '</span></div>' +
           '<div class="wbs-mi wbs-token-cell"><span class="wbs-lbl">有效期至</span><span class="wbs-val' + (ts.warn ? ' wbs-warn' : '') + '">' + esc(ts.label) + '</span></div>' +
@@ -17860,7 +18260,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     /* 休眠状态仍由天线顶部圆点提示。 */
     '@keyframes wbs-sleep-pulse{0%,100%{box-shadow:0 0 5px 1px rgba(46,229,157,.6)}50%{box-shadow:0 0 13px 4px rgba(46,229,157,.95)}}',
     '@keyframes wbs-sleep-pulse-amber{0%,100%{box-shadow:0 0 5px 1px rgba(255,176,58,.6)}50%{box-shadow:0 0 13px 4px rgba(255,176,58,.95)}}',
-    '.wbs-fab.hidden{display:none}',
+    '.wbs-fab.hidden,.wbs-fab.is-area-hidden{display:none}',
     '.wbs-fab .click{position:relative;transition:transform .22s cubic-bezier(.22,1,.36,1)}',
     '.wbs-fab .click > span:not(.wbs-fab-antenna){display:none}',
     '.wbs-fab .button.shadow{display:none}',
@@ -17896,7 +18296,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
     '.wbs-fab:hover{transform:scale(0.5)}.wbs-fab:hover .eye{scale:1.18}',
     '.wbs-fab:active{transform:scale(0.5) translate(2px,2px)}',
-    '.wbs-fab.is-quiet{transform:translateX(var(--wbs-fab-quiet-shift,59px)) scale(0.5)}',
+    '.wbs-fab.is-quiet{transform:translateX(var(--wbs-fab-quiet-shift,59px)) scale(0.5);clip-path:inset(-100px var(--wbs-fab-quiet-clip,0px) -100px -100px)}',
     '.wbs-fab.is-quiet .click{transform:rotate(-90deg)}',
     '.wbs-fab.is-quiet .wbs-fab-health-dot{visibility:hidden}',
     '.wbs-fab.is-quiet .wbs-fab-antenna,.wbs-fab.is-quiet .wbs-fab-antenna-dot{visibility:hidden}',
@@ -17925,6 +18325,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-language-card .wbs-settings-row{justify-content:space-between}',
     '.wbs-language-card .wbs-pcard-title{margin-bottom:0}',
     '.wbs-rendering-card .wbs-pcard-title{margin-bottom:0;min-width:0}',
+    '.wbs-client-temp-card .wbs-pcard-sub{margin-top:6px;line-height:1.6;color:var(--wb-color-text-secondary);white-space:normal;overflow-wrap:anywhere}.wbs-client-temp-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}.wbs-client-temp-actions button{min-width:80px}.wbs-client-temp-actions button:disabled{opacity:.5;cursor:default}.wbs-client-temp-actions button:focus-visible,.wbs-client-temp-mask button:focus-visible{outline:2px solid var(--wb-accent-primary,var(--wb-color-text-primary));outline-offset:2px}.wbs-client-temp-mask{pointer-events:auto;padding:12px;box-sizing:border-box}.wbs-client-temp-mask .wbs-modal{max-height:calc(100vh - 24px);overflow:auto;box-sizing:border-box}.wbs-client-temp-mask .wbs-modal-body{line-height:1.6;white-space:normal;overflow-wrap:anywhere}',
     '.wbs-rendering-card .wbs-pcard-sub{margin-top:6px;line-height:1.6;color:var(--wb-color-text-secondary);white-space:normal;overflow-wrap:anywhere}',
     '.wbs-lang-seg{flex:0 0 auto;width:auto;margin-bottom:0}',
     '.wbs-lang-seg .wbs-sess-seg-btn{padding:6px 14px}',
@@ -17949,7 +18350,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-ava{width:34px;height:34px;border-radius:50%;background:var(--wb-bg-tertiary,#f0f0f0);color:var(--wb-icon-secondary,#555);display:flex;align-items:center;justify-content:center;font-weight:600;flex-shrink:0;font-size:14px}',
     '.wbs-info{min-width:0}',
     '.wbs-row1{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:7px;min-height:26px}',
-    '.wbs-name-group{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-width:0}.wbs-checkin-slot{display:inline-flex;align-items:center;flex-wrap:wrap;gap:5px}',
+    '.wbs-name-group{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-width:0}.wbs-checkin-slot,.wbs-travel-slot{display:inline-flex;align-items:center;flex-wrap:wrap;gap:5px}',
     '.wbs-name{font-size:14px;font-weight:600;color:var(--wb-color-text-primary,#1f1f1f)}',
     '.wbs-account-name{position:relative;display:inline-flex;align-items:center;min-width:0;max-width:100%;margin:0;padding:0;border:0;background:transparent;font:inherit;text-align:left;cursor:pointer;isolation:isolate}.wbs-account-name .wbs-name{position:relative;z-index:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.wbs-account-name:before{content:"";position:absolute;inset:-4px -5px;border:1px solid var(--wb-border-subtle,#e5e7eb);border-radius:7px;background:var(--wb-bg-popover,#fff);box-shadow:0 2px 7px rgba(0,0,0,.08);opacity:0;transition:opacity 200ms ease;pointer-events:none}.wbs-account-name-edit{position:absolute;right:0;top:50%;z-index:2;display:flex;align-items:center;justify-content:center;width:20px;max-width:100%;height:20px;border-radius:3px;background:var(--wb-bg-popover,#fff);color:var(--wb-icon-secondary,#666);opacity:0;transform:translateY(-50%);transition:opacity 200ms ease;pointer-events:none}.wbs-account-name-edit svg{width:13px;height:13px}.wbs-account-name:hover,.wbs-account-name:focus-visible,.wbs-account-name[aria-expanded="true"]{z-index:2}.wbs-account-name:hover:before,.wbs-account-name:focus-visible:before,.wbs-account-name[aria-expanded="true"]:before{opacity:1}.wbs-account-name:hover .wbs-account-name-edit,.wbs-account-name:focus-visible .wbs-account-name-edit,.wbs-account-name[aria-expanded="true"] .wbs-account-name-edit{opacity:1;pointer-events:auto}.wbs-account-name-edit:hover{color:var(--wb-color-text-primary,#1f1f1f)}.wbs-root.wbs-acct-note-hover-off .wbs-account-name:hover:not(:focus-visible):not([aria-expanded="true"]) .wbs-account-name-edit{opacity:0;pointer-events:none}.wbs-root.wbs-acct-note-hover-off .wbs-account-name:hover:not(:focus-visible):not([aria-expanded="true"]):before{opacity:0}.wbs-account-name:focus-visible{outline:2px solid var(--wb-accent-primary,var(--wb-color-text-primary,#1f1f1f));outline-offset:4px;border-radius:4px}',
     '.wbs-account-note-popover{position:fixed;z-index:2147483647;box-sizing:border-box;width:280px;max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);overflow:auto;padding:10px;border:1px solid var(--wb-border-subtle,#e5e7eb);border-radius:12px;background:color-mix(in srgb,var(--wb-bg-popover,#fff) 94%,transparent);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);box-shadow:0 10px 30px rgba(0,0,0,.16);color:var(--wb-color-text-primary,#1f1f1f);font:12px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;overscroll-behavior:contain}.wbs-account-note-popover[hidden]{display:none}.wbs-account-note-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:7px;font-weight:600}.wbs-account-note-head .wbs-icon-btn{width:22px;height:22px}.wbs-account-note-popover textarea{display:block;box-sizing:border-box;width:100%;min-height:86px;max-height:180px;resize:vertical;padding:8px;border:1px solid var(--wb-border-default,#ddd);border-radius:8px;background:var(--wb-bg-secondary,#f7f8fa);color:inherit;font:inherit;line-height:1.6;overflow-wrap:anywhere;user-select:text}.wbs-account-note-popover textarea::placeholder{color:var(--wb-color-text-secondary,#777)}.wbs-account-note-popover textarea:focus-visible,.wbs-account-note-popover button:focus-visible{outline:2px solid var(--wb-accent-primary,var(--wb-color-text-primary,#1f1f1f));outline-offset:2px}.wbs-account-note-footer{display:flex;align-items:center;gap:6px;margin-top:9px}.wbs-account-note-footer [role="status"]{flex:1;min-width:0;overflow-wrap:anywhere;font-size:11px;color:var(--wb-color-text-secondary,#666)}.wbs-account-note-footer .wbs-modal-btn{flex:none;padding:4px 9px;font-size:11px}.wbs-account-note-footer .primary{background:var(--wb-button-primary-bg,#1f1f1f);border-color:var(--wb-button-primary-bg,#1f1f1f);color:var(--wb-button-primary-fg,#fff)}.wbs-account-note-footer .primary:hover:not(:disabled){background:var(--wb-button-primary-bg-hover,var(--wb-button-primary-bg,#333))}.wbs-account-note-footer button:disabled{opacity:.45;cursor:default}',
@@ -18036,7 +18437,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     ':is(html.cb-dark,html[data-theme="dark"],html[data-wbs-theme-id="dark"],html[data-wbs-theme-id="cyber-purple"],html[data-wbs-theme-id="nebula"],body[data-vscode-theme-name*="dark" i]) .wbs-daily-rings:not(:where([data-wbs-appearance="light"] *,.wbs-panel-light *)),:is(html.cb-dark,html[data-theme="dark"],html[data-wbs-theme-id="dark"],html[data-wbs-theme-id="cyber-purple"],html[data-wbs-theme-id="nebula"],body[data-vscode-theme-name*="dark" i]) .wbs-checkin-tag.ok:not(:where([data-wbs-appearance="light"] *,.wbs-panel-light *)){--wbs-badge-bg:rgba(255,255,255,.085);--wbs-badge-fg:var(--wb-color-text-primary,#f6f5ff);background:var(--wbs-badge-bg);border:1px solid rgba(255,255,255,.12);color:var(--wbs-badge-fg);box-shadow:inset 0 1px 0 rgba(255,255,255,.08);backdrop-filter:blur(12px) saturate(1.08);-webkit-backdrop-filter:blur(12px) saturate(1.08)}:is(html.cb-dark,html[data-theme="dark"],html[data-wbs-theme-id="dark"],html[data-wbs-theme-id="cyber-purple"],html[data-wbs-theme-id="nebula"],body[data-vscode-theme-name*="dark" i]) .wbs-daily-rings:not(:where([data-wbs-appearance="light"] *,.wbs-panel-light *)){--wbs-liquid-bg:rgba(255,255,255,.12);--wbs-liquid-ink:#f6f5ff}:is(html.cb-dark,html[data-theme="dark"],html[data-wbs-theme-id="dark"],html[data-wbs-theme-id="cyber-purple"],html[data-wbs-theme-id="nebula"],body[data-vscode-theme-name*="dark" i]) .wbs-daily-rings:not(:where([data-wbs-appearance="light"] *,.wbs-panel-light *)):hover,:is(html.cb-dark,html[data-theme="dark"],html[data-wbs-theme-id="dark"],html[data-wbs-theme-id="cyber-purple"],html[data-wbs-theme-id="nebula"],body[data-vscode-theme-name*="dark" i]) .wbs-daily-rings:not(:where([data-wbs-appearance="light"] *,.wbs-panel-light *))[aria-expanded="true"]{background:rgba(255,255,255,.14);box-shadow:inset 0 1px 0 rgba(255,255,255,.1),0 3px 10px rgba(0,0,0,.12)}',
     '.wbs-checkin-tag.fail{background:rgba(239,68,68,.1);color:#dc2626}',
     '.wbs-model-rate-limit-slot{display:inline-flex;align-items:center;min-width:0}.wbs-model-rate-limit{appearance:none;-webkit-appearance:none;font:inherit;cursor:pointer;transition:background-color .15s,box-shadow .15s,color .15s}.wbs-model-rate-limit:hover,.wbs-model-rate-limit[aria-expanded="true"]{background:color-mix(in srgb,var(--wbs-badge-bg) 84%,white);box-shadow:0 2px 8px rgba(0,0,0,.14)}.wbs-model-rate-limit:focus-visible{outline:2px solid color-mix(in srgb,var(--wbs-badge-bg) 45%,transparent);outline-offset:2px}',
-    '.wbs-status-popover.is-rate-limit{width:500px;max-width:calc(100vw - 16px);overflow-x:auto}.wbs-status-popover.is-rate-limit-summary{width:360px;max-width:calc(100vw - 16px);overflow-x:auto}.wbs-model-rate-limit-detail{grid-template-columns:8px auto minmax(0,1fr) auto auto;gap:7px}.wbs-model-rate-limit-detail b{white-space:nowrap;overflow-wrap:normal}.wbs-model-rate-limit-detail .wbs-model-rate-limit-model{text-align:left}.wbs-model-rate-limit-detail i.rate-limit{color:var(--wb-color-text-primary,#1f1f1f)}.wbs-model-rate-limit-account-group{padding:7px 0 2px;border-top:1px solid var(--wb-border-subtle,rgba(20,24,32,.1))}.wbs-model-rate-limit-account-group:first-of-type{padding-top:0;border-top:0}.wbs-model-rate-limit-account-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 2px 2px}.wbs-model-rate-limit-account-head strong{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}.wbs-model-rate-limit-account-head span{flex:0 0 auto;color:var(--wb-icon-tertiary,#7c818b);font-size:10px;white-space:nowrap}.wbs-model-rate-limit-summary-row{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,auto);align-items:center;gap:7px;min-height:28px;margin-top:4px;padding:0 8px;border:1px solid var(--wb-border-subtle,rgba(20,24,32,.1));border-radius:8px;background:color-mix(in srgb,var(--wb-bg-secondary,#f6f7f8) 72%,transparent)}.wbs-model-rate-limit-summary-row>span{color:var(--wb-color-text-secondary,#5f6368);white-space:nowrap}.wbs-model-rate-limit-summary-row>b{min-width:0;font-size:11px;font-weight:650;white-space:nowrap;overflow-wrap:normal}.wbs-model-rate-limit-summary-row .wbs-model-rate-limit-model{text-align:left}.wbs-model-rate-limit-summary-row .wbs-model-rate-limit-reset{text-align:right}',
+    '.wbs-status-popover.is-rate-limit{width:500px;max-width:calc(100vw - 16px);overflow-x:auto}.wbs-status-popover.is-rate-limit-summary{width:360px;max-width:calc(100vw - 16px);overflow-x:auto}.wbs-model-rate-limit-detail{grid-template-columns:8px auto minmax(0,1fr) auto auto;gap:7px}.wbs-model-rate-limit-detail b{white-space:nowrap;overflow-wrap:normal}.wbs-model-rate-limit-detail .wbs-model-rate-limit-model{text-align:left}.wbs-model-rate-limit-detail i.rate-limit{color:var(--wb-color-text-primary,#1f1f1f)}.wbs-model-rate-limit-account-group{padding:7px 0 2px;border-top:1px solid var(--wb-border-subtle,rgba(20,24,32,.1))}.wbs-model-rate-limit-account-group:first-of-type{padding-top:0;border-top:0}.wbs-model-rate-limit-account-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 2px 2px}.wbs-model-rate-limit-account-head strong{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}.wbs-model-rate-limit-account-head span{flex:0 0 auto;color:var(--wb-icon-tertiary,#7c818b);font-size:10px;white-space:nowrap}.wbs-model-rate-limit-summary-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto minmax(0,auto);align-items:center;gap:7px;min-height:28px;margin-top:4px;padding:0 8px;border:1px solid var(--wb-border-subtle,rgba(20,24,32,.1));border-radius:8px;background:color-mix(in srgb,var(--wb-bg-secondary,#f6f7f8) 72%,transparent)}.wbs-model-rate-limit-summary-row>span{color:var(--wb-color-text-secondary,#5f6368);white-space:nowrap}.wbs-model-rate-limit-summary-row>b{min-width:0;font-size:11px;font-weight:650;white-space:nowrap;overflow-wrap:normal}.wbs-model-rate-limit-summary-row .wbs-model-rate-limit-model{text-align:left}.wbs-model-rate-limit-summary-row .wbs-model-rate-limit-reset{text-align:right}',
     ':is(html.cb-dark,html[data-theme="dark"],body[data-vscode-theme-name*="dark" i]) .wbs-model-rate-limit:hover,:is(html.cb-dark,html[data-theme="dark"],body[data-vscode-theme-name*="dark" i]) .wbs-model-rate-limit[aria-expanded="true"]{background:rgba(255,255,255,.14);box-shadow:inset 0 1px 0 rgba(255,255,255,.1),0 3px 10px rgba(0,0,0,.12)}',
     '.wbs-ck.pending{color:var(--wb-icon-tertiary,#999)}',
     '.wbs-ck.fail{color:#f53f3f}',
@@ -18132,7 +18533,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-explore-card{position:relative;padding:8px;border-radius:12px;background:color-mix(in srgb,var(--wb-bg-popover,#fff) 62%,transparent);backdrop-filter:blur(18px) saturate(1.3);-webkit-backdrop-filter:blur(18px) saturate(1.3);border:1px solid var(--wb-border-subtle,#ececec);box-shadow:0 12px 32px rgba(0,0,0,.18);color:var(--wb-color-text-primary,#1f1f1f);cursor:default}',
     'html[data-wbs-theme-id="nebula"] .wbs-explore-card{background:color-mix(in srgb,var(--wb-bg-popover,#1a1729) 88%,transparent);background-color:color-mix(in srgb,var(--wb-bg-popover,#1a1729) 88%,transparent);box-shadow:0 14px 36px rgba(0,0,0,.38)}',
     '.wbs-explore-item{position:relative;display:flex;align-items:center;gap:8px;padding:9px 10px;border-radius:8px;font-size:12px;color:var(--wb-color-text-primary,#1f1f1f);line-height:1.4;cursor:pointer}',
-    '.wbs-explore-it{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+    '.wbs-explore-insert{display:flex;align-items:center;justify-content:center;position:absolute;right:7px;top:50%;transform:translateY(-50%);width:26px;height:26px;border:1px solid var(--wb-border-subtle,#ddd);border-radius:6px;background:var(--wb-bg-primary,#fff);color:var(--wb-icon-secondary,#666);opacity:0;pointer-events:none;cursor:pointer}',
+    '.wbs-explore-item:hover .wbs-explore-insert,.wbs-explore-item:focus-within .wbs-explore-insert{opacity:1;pointer-events:auto}',
+    '.wbs-explore-it:focus-visible,.wbs-explore-insert:focus-visible{outline:2px solid var(--wb-accent-color,var(--wb-button-primary-bg,#555));outline-offset:1px}',
+    '.wbs-explore-insert:hover{color:var(--wb-color-text-primary,#222);background:var(--wb-bg-hover,#f3f3f3)}',
+    '.wbs-explore-it{flex:1;min-width:0;padding-right:34px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
     '.wbs-explore-item:hover{background:color-mix(in srgb,var(--wb-bg-hover,#f3f3f3) 76%,transparent)}',
     /* 选项 hover：antd 风格 tooltip（半透明毛玻璃小气泡，出现在选项左侧，完全展示文字） */
     '.wbs-explore-tip{position:absolute;right:calc(100% + 10px);top:50%;transform:translateY(-50%);display:block;width:max-content;padding:5px 11px;border-radius:8px;font-size:11px;line-height:1.35;white-space:normal;word-break:break-word;max-width:240px;color:var(--wb-color-text-primary,#1f1f1f);background:var(--wb-bg-popover,#fff);border:1px solid color-mix(in srgb,var(--wb-border-subtle,#ececec) 65%,transparent);box-shadow:0 6px 20px rgba(0,0,0,.16);opacity:0;visibility:hidden;transition:opacity .15s ease;pointer-events:none;z-index:2}',
@@ -18159,8 +18564,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-qp-batchbar{display:inline-flex;align-items:center;gap:6px;margin-right:8px}',
     '.wbs-qp-batch-count{font-size:11px;color:var(--wb-color-text-secondary,#666)}',
     '.wbs-qp-batch-action{color:#d64545}',
-    '.wbs-qp-list{display:flex;flex-direction:column;max-height:220px;overflow-y:auto}',
+    '.wbs-qp-list{position:relative;display:flex;flex-direction:column;max-height:220px;overflow-y:auto;overflow-anchor:none}',
     '.wbs-qp-row{display:flex;align-items:center;gap:8px;padding:5px 8px;border-bottom:1px solid var(--wb-border-subtle,#eee)}',
+    '.wbs-qp-drag{display:flex;align-items:center;justify-content:center;width:22px;height:24px;padding:0;border:0;border-radius:5px;background:transparent;color:var(--wb-icon-secondary,#777);cursor:grab;flex:0 0 auto}',
+    '.wbs-qp-drag:active{cursor:grabbing}.wbs-qp-row.wbs-qp-dragging{opacity:.45;background:var(--wb-bg-hover,#f3f3f3);outline:1px dashed var(--wb-border-default,#ccc);outline-offset:-2px}.wbs-qp-list[aria-busy="true"] .wbs-qp-drag{cursor:wait}',
     '.wbs-qp-row:hover{background:color-mix(in srgb,var(--wb-bg-hover,#f3f3f3) 45%,transparent)}',
     '.wbs-qp-check{margin:0;width:14px;height:14px;flex:0 0 auto;accent-color:var(--wb-button-primary-bg,#1f1f1f)}',
     '.wbs-qp-text{flex:1;font-size:12px;line-height:1.5;color:var(--wb-color-text-primary,#1f1f1f);overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;white-space:nowrap;word-break:break-all}',
@@ -18222,7 +18629,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '#wbs-auto-discover.is-loading svg{animation:wbs-auto-discover-pulse 1s ease-in-out infinite}@keyframes wbs-auto-discover-pulse{50%{opacity:.35}}#wbs-auto-discover:disabled{cursor:wait;opacity:.68}',
     '.wbs-modal.wbs-auto-discovery-modal{display:grid;grid-template-rows:auto auto minmax(0,1fr);gap:9px;width:calc(100% - 24px);max-width:620px;height:min(560px,calc(100% - 28px));box-sizing:border-box;overflow:hidden}.wbs-auto-discovery-note{margin-top:3px;color:var(--wb-color-text-secondary,#666);font-size:11px;line-height:1.45}.wbs-auto-discovery-toolbar{display:flex;align-items:center;gap:7px;margin-top:8px}.wbs-auto-discovery-search{box-sizing:border-box;flex:1;min-width:0;height:32px;padding:6px 10px;border:1px solid var(--wb-border-default,#ddd);border-radius:8px;background:var(--wb-bg-popover,#fff);color:var(--wb-color-text-primary,#1f1f1f);font:inherit;font-size:12px;outline:none}.wbs-auto-discovery-search:focus{border-color:var(--wb-button-primary-bg,#1f1f1f);box-shadow:0 0 0 2px color-mix(in srgb,var(--wb-button-primary-bg,#1f1f1f) 18%,transparent)}.wbs-auto-discovery-search::placeholder{color:var(--wb-icon-tertiary,#888)}.wbs-auto-discovery-filter{flex:0 0 auto;height:32px;padding:0 10px;border:1px solid var(--wb-border-default,#ddd);border-radius:8px;background:var(--wb-bg-tertiary,#f5f5f5);color:var(--wb-color-text-secondary,#666);font:inherit;font-size:11px;cursor:pointer}.wbs-auto-discovery-filter:hover,.wbs-auto-discovery-filter.active{border-color:var(--wb-button-primary-bg,#1f1f1f);background:var(--wb-button-primary-bg,#1f1f1f);color:var(--wb-button-primary-fg,#fff)}.wbs-auto-discovery-filter:focus-visible{outline:2px solid var(--wb-button-primary-bg,#1f1f1f);outline-offset:1px}',
     '.wbs-auto-discovery-header .wbs-auto-modal-head>div:first-child{min-width:0}.wbs-auto-discovery-status[hidden]{display:none}',
-    '.wbs-auto-discovery-list{display:flex;min-height:0;flex-direction:column;gap:6px;overflow:auto;padding-right:2px}.wbs-auto-discovery-empty{display:flex;min-height:160px;align-items:center;justify-content:center;color:var(--wb-icon-tertiary,#888);font-size:12px}.wbs-auto-discovery-item{display:flex;flex:0 0 auto;flex-direction:column;gap:6px;padding:9px 10px;border:1px solid var(--wb-border-subtle,#e5e5e5);border-radius:9px;background:color-mix(in srgb,var(--wb-bg-secondary,#fff) 24%,transparent)}.wbs-auto-discovery-head{display:flex;align-items:center;gap:8px}.wbs-auto-discovery-name{min-width:0;flex:1;color:var(--wb-color-text-primary,#1f1f1f);font-size:12px;font-weight:650;line-height:1.4;overflow-wrap:anywhere}.wbs-auto-discovery-version{flex:0 0 auto;padding:2px 6px;border:1px solid var(--wb-border-default,#ddd);border-radius:6px;background:var(--wb-bg-tertiary,#f5f5f5);color:var(--wb-color-text-secondary,#666);font-size:10px;font-weight:600;white-space:nowrap}.wbs-auto-discovery-favorite{display:inline-flex;align-items:center;justify-content:center;gap:3px;flex:0 0 auto;min-width:34px;height:26px;padding:0 5px;border:0;border-radius:7px;background:transparent;color:var(--wb-icon-tertiary,#888);font:inherit;font-size:10px;cursor:pointer}.wbs-auto-discovery-favorite:hover,.wbs-auto-discovery-favorite:focus-visible{background:var(--wb-bg-hover,#f0f0f0);color:var(--wb-color-text-primary,#1f1f1f);outline:none}.wbs-auto-discovery-favorite.is-active{color:var(--wb-button-primary-bg,var(--wb-color-text-primary,#1f1f1f))}.wbs-auto-discovery-favorite:disabled{opacity:.5;cursor:wait}.wbs-auto-discovery-favorite svg{display:block;flex:0 0 16px}.wbs-auto-discovery-favorite.is-active svg{fill:currentColor}.wbs-auto-discovery-description{color:var(--wb-color-text-secondary,#666);font-size:11px;line-height:1.45;overflow-wrap:anywhere}.wbs-auto-discovery-foot{display:flex;align-items:flex-end;gap:8px}.wbs-auto-sources{display:flex;min-width:0;flex:1;flex-wrap:wrap;gap:4px}.wbs-auto-source{max-width:100%;padding:3px 6px;border:1px solid var(--wb-border-subtle,#ddd);border-radius:6px;background:var(--wb-bg-tertiary,#f5f5f5);color:var(--wb-color-text-secondary,#666);font:inherit;font-size:10px;line-height:1.3;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.wbs-auto-source:hover,.wbs-auto-source:focus-visible{border-color:var(--wb-border-strong,#bbb);color:var(--wb-color-text-primary,#1f1f1f);outline:none}.wbs-auto-discovery-foot>.wbs-modal-btn{flex:0 0 auto;min-width:48px;padding:5px 9px}.wbs-auto-discovery-foot>.wbs-modal-btn:disabled{opacity:.45;cursor:not-allowed}',
+    '.wbs-auto-discovery-list{display:flex;min-height:0;flex-direction:column;gap:6px;overflow:auto;padding-right:2px}.wbs-auto-discovery-empty{display:flex;min-height:160px;align-items:center;justify-content:center;color:var(--wb-icon-tertiary,#888);font-size:12px}.wbs-auto-discovery-item{display:flex;flex:0 0 auto;flex-direction:column;gap:6px;padding:9px 10px;border:1px solid var(--wb-border-subtle,#e5e5e5);border-radius:9px;background:color-mix(in srgb,var(--wb-bg-secondary,#fff) 24%,transparent)}.wbs-auto-discovery-head{display:flex;align-items:center;gap:8px}.wbs-auto-discovery-number{flex:0 0 auto;color:var(--wb-color-text-secondary,#666);font-size:11px;font-variant-numeric:tabular-nums}.wbs-auto-discovery-name{min-width:0;flex:1;color:var(--wb-color-text-primary,#1f1f1f);font-size:12px;font-weight:650;line-height:1.4;overflow-wrap:anywhere}.wbs-auto-discovery-version{flex:0 0 auto;padding:2px 6px;border:1px solid var(--wb-border-default,#ddd);border-radius:6px;background:var(--wb-bg-tertiary,#f5f5f5);color:var(--wb-color-text-secondary,#666);font-size:10px;font-weight:600;white-space:nowrap}.wbs-auto-discovery-favorite{display:inline-flex;align-items:center;justify-content:center;gap:3px;flex:0 0 auto;min-width:34px;height:26px;padding:0 5px;border:0;border-radius:7px;background:transparent;color:var(--wb-icon-tertiary,#888);font:inherit;font-size:10px;cursor:pointer}.wbs-auto-discovery-favorite:hover,.wbs-auto-discovery-favorite:focus-visible{background:var(--wb-bg-hover,#f0f0f0);color:var(--wb-color-text-primary,#1f1f1f);outline:none}.wbs-auto-discovery-favorite.is-active{color:var(--wb-button-primary-bg,var(--wb-color-text-primary,#1f1f1f))}.wbs-auto-discovery-favorite:disabled{opacity:.5;cursor:wait}.wbs-auto-discovery-favorite svg{display:block;flex:0 0 16px}.wbs-auto-discovery-favorite.is-active svg{fill:currentColor}.wbs-auto-discovery-description{color:var(--wb-color-text-secondary,#666);font-size:11px;line-height:1.45;overflow-wrap:anywhere}.wbs-auto-discovery-foot{display:flex;align-items:flex-end;gap:8px}.wbs-auto-sources{display:flex;min-width:0;flex:1;flex-wrap:wrap;gap:4px}.wbs-auto-source{max-width:100%;padding:3px 6px;border:1px solid var(--wb-border-subtle,#ddd);border-radius:6px;background:var(--wb-bg-tertiary,#f5f5f5);color:var(--wb-color-text-secondary,#666);font:inherit;font-size:10px;line-height:1.3;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.wbs-auto-source:hover,.wbs-auto-source:focus-visible{border-color:var(--wb-border-strong,#bbb);color:var(--wb-color-text-primary,#1f1f1f);outline:none}.wbs-auto-discovery-foot>.wbs-modal-btn{flex:0 0 auto;min-width:48px;padding:5px 9px}.wbs-auto-discovery-foot>.wbs-modal-btn:disabled{opacity:.45;cursor:not-allowed}',
     '.wbs-auto-batchbar{display:flex;align-items:center;gap:6px;margin:4px 0 7px}.wbs-auto-batch-count{margin-right:auto;color:var(--wb-icon-tertiary,#888);font-size:11px}.wbs-auto-field input,.wbs-auto-field textarea{box-sizing:border-box;width:100%;border:1px solid var(--wb-border-default,#dedede);border-radius:7px;background:var(--wb-bg-popover,#fff);color:var(--wb-color-text-primary,#1f1f1f);font:inherit;font-size:12px;outline:none}.wbs-auto-field{display:flex;flex-direction:column;gap:4px;margin-bottom:8px;color:var(--wb-icon-secondary,#666);font-size:11px}.wbs-auto-field input{height:30px;padding:5px 8px}.wbs-auto-field textarea{min-height:72px;padding:8px;resize:vertical;line-height:1.45}.wbs-auto-field textarea[data-auto-field="steps"]{min-height:150px;resize:none;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.wbs-auto-field input:focus,.wbs-auto-field textarea:focus{border-color:var(--wb-button-primary-bg,#1f1f1f);box-shadow:0 0 0 2px color-mix(in srgb,var(--wb-button-primary-bg,#1f1f1f) 20%,transparent)}.wbs-auto-trigger-seg{display:flex;gap:3px;padding:3px;border-radius:9px;background:var(--wb-bg-tertiary,#f0f0f0)}.wbs-auto-trigger-seg label{flex:1;display:flex;align-items:center;justify-content:center;min-height:28px;padding:0 8px;border-radius:7px;color:var(--wb-icon-secondary,#666);cursor:pointer}.wbs-auto-trigger-seg input{position:absolute;opacity:0;pointer-events:none}.wbs-auto-trigger-seg label:has(input:checked){background:var(--wb-button-primary-bg,#1f1f1f);color:var(--wb-button-primary-fg,#fff);box-shadow:0 1px 4px rgba(0,0,0,.16)}',
     '.wbs-modal.wbs-auto-agent-modal{display:flex;flex-direction:column;width:calc(100% - 24px);max-width:520px;max-height:calc(100% - 28px);box-sizing:border-box}.wbs-auto-agent-intro{margin:0 0 14px;color:var(--wb-color-text-secondary,#666);font-size:12px;line-height:1.6;overflow-wrap:anywhere}.wbs-auto-agent-input-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:7px;font-size:12px;font-weight:600}.wbs-auto-agent-input-head #wbs-auto-examples{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:5px}.wbs-auto-example-fill{border:1px solid var(--wb-border-subtle,#ddd);border-radius:6px;padding:3px 8px;background:var(--wb-bg-tertiary,#f5f5f5);font-weight:400}.wbs-auto-agent-prompt{display:block;box-sizing:border-box;flex:1 1 160px;min-height:60px;width:100%;height:160px;max-height:26vh;resize:none;overflow:auto;padding:10px 12px;border:1px solid var(--wb-border-default,#ddd);border-radius:9px;background:var(--wb-bg-tertiary,#f5f5f5);color:var(--wb-color-text-primary,#1f1f1f);font-family:inherit;font-size:12px;line-height:1.65;white-space:pre-wrap;overflow-wrap:anywhere}.wbs-auto-agent-prompt:focus{outline:2px solid color-mix(in srgb,var(--wb-button-primary-bg,#1f1f1f) 30%,transparent);outline-offset:1px;border-color:var(--wb-button-primary-bg,#1f1f1f)}.wbs-auto-agent-prompt::placeholder{color:var(--wb-icon-tertiary,#888)}.wbs-auto-agent-hint{margin:8px 0 14px;font-size:11px;color:var(--wb-color-text-secondary,#666)}.wbs-auto-agent-modal .wbs-modal-actions{flex-shrink:0;margin-top:0}.wbs-auto-agent-modal .wbs-modal-ok:disabled{opacity:.4;cursor:default}',
     '.wbs-auto-modal-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:0 0 10px}.wbs-auto-modal-head .wbs-modal-title{margin:0}.wbs-auto-modal-subtitle{max-width:360px;margin-top:3px;color:var(--wb-icon-tertiary,#888);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.wbs-auto-modal-close{display:inline-flex;align-items:center;justify-content:center;flex:0 0 26px;width:26px;height:26px;padding:0;border:0;border-radius:7px;background:transparent;color:var(--wb-icon-secondary,#666);cursor:pointer}.wbs-auto-modal-close:hover,.wbs-auto-modal-close:focus-visible{background:var(--wb-bg-hover,#eee);color:var(--wb-color-text-primary,#222);outline:none}.wbs-auto-modal-close svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round}',
@@ -18274,7 +18681,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-sess-copy-progress{box-sizing:border-box;margin:0 0 8px;padding:9px 10px;border:1px solid var(--wb-border-default,#e5e5e5);border-radius:9px;background:color-mix(in srgb,var(--wb-bg-secondary,#fff) 82%,transparent);box-shadow:0 2px 8px rgba(0,0,0,.04)}',
     '.wbs-sess-copy-progress[hidden]{display:none!important}.wbs-sess-copy-head{display:flex;align-items:center;gap:6px;min-width:0}.wbs-sess-copy-icon{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;flex:0 0 20px;border-radius:6px;background:color-mix(in srgb,var(--wb-button-primary-bg,#1f1f1f) 9%,transparent);color:var(--wb-button-primary-bg,#1f1f1f)}.wbs-sess-copy-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px;font-weight:650;color:var(--wb-color-text-primary,#1f1f1f)}',
     '.wbs-sess-copy-detail{margin:4px 0 6px 26px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10.5px;line-height:1.35;color:var(--wb-icon-tertiary,#8a8f98)}.wbs-sess-copy-track{height:4px;margin-left:26px;overflow:hidden;border-radius:999px;background:var(--wb-bg-tertiary,#e9eaed)}.wbs-sess-copy-fill{display:block;height:100%;width:0;border-radius:inherit;background:var(--wb-accent-blue,var(--wb-button-primary-bg,#1f1f1f));transition:width .2s ease}.wbs-sess-copy-progress.is-done .wbs-sess-copy-fill{background:#2f9e63}.wbs-sess-copy-progress.is-partial .wbs-sess-copy-fill{background:#d48a19}.wbs-sess-copy-progress.is-error .wbs-sess-copy-fill{background:#d84a4a}',
+    '.wbs-sess-copy-progress.is-error .wbs-sess-copy-detail{white-space:normal;overflow-wrap:anywhere}',
     'html.cb-dark .wbs-sess-copy-progress,html[data-theme="dark"] .wbs-sess-copy-progress,body[data-vscode-theme-name*="dark" i] .wbs-sess-copy-progress{border-color:var(--wb-border-default,rgba(255,255,255,.14));background:color-mix(in srgb,var(--wb-bg-secondary,#25262a) 88%,transparent);box-shadow:0 3px 12px rgba(0,0,0,.18)}',
+    ':is(html.cb-dark,html[data-theme="dark"],body[data-vscode-theme-name*="dark" i]) .wbs-sess-copy-title{color:var(--wb-color-text-primary,#f2f3f5)}',
     '.wbs-sess-refresh{display:flex;align-items:center;justify-content:center;flex-shrink:0;padding:7px;border:1px solid var(--wb-border-default,#e5e5e5);border-radius:9px;background:var(--wb-bg-popover,#fff);color:var(--wb-icon-secondary,#555);font-size:12px;cursor:pointer;line-height:1;transition:all .15s}',
     '.wbs-sess-refresh:hover{background:var(--wb-bg-hover,#f5f5f5);color:var(--wb-color-text-primary,#1f1f1f)}',
     '.wbs-sess-bbtn{display:inline-flex;align-items:center;justify-content:center;gap:4px;padding:7px 12px;border:1px solid var(--wb-border-default,#e5e5e5);border-radius:9px;background:var(--wb-bg-popover,#fff);color:var(--wb-icon-secondary,#555);font-size:12px;cursor:pointer;line-height:1;transition:all .15s}',
@@ -18524,6 +18933,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-telemetry-help:hover,.wbs-telemetry-help:focus{color:var(--wb-color-text-primary,#1f1f1f)}',
     '.wbs-telemetry-tooltip{position:absolute;z-index:20;left:0;top:calc(100% + 7px);width:245px;padding:7px 9px;border:1px solid var(--wb-border-default,rgba(0,0,0,.14));border-radius:7px;background:var(--wb-bg-primary,#fff);box-shadow:0 6px 18px rgba(0,0,0,.14);color:var(--wb-color-text-primary,#1f1f1f);font-size:11px;font-weight:400;line-height:1.5;white-space:normal;opacity:0;visibility:hidden;pointer-events:none;transform:translateY(-2px);transition:opacity .12s,transform .12s,visibility .12s}',
     '.wbs-telemetry-help:hover .wbs-telemetry-tooltip,.wbs-telemetry-help:focus .wbs-telemetry-tooltip{opacity:1;visibility:visible;transform:translateY(0)}',
+    '.wbs-qp-insert-tooltip{position:fixed;z-index:2147483647;box-sizing:border-box;width:max-content;max-width:calc(100vw - 16px);transform:none;overflow-wrap:anywhere}.wbs-qp-insert-tooltip.is-visible{opacity:1;visibility:visible;transform:none}',
+    '.wbs-explore-action-tip .wbs-explore-tip{opacity:0!important;visibility:hidden!important;pointer-events:none!important}',
+    'html.cb-dark .wbs-qp-insert-tooltip,html[data-theme="dark"] .wbs-qp-insert-tooltip,body[data-vscode-theme-name*="dark" i] .wbs-qp-insert-tooltip{background:var(--wb-bg-popover,#202126);color:var(--wb-color-text-primary,#f2f3f5);border-color:var(--wb-border-default,rgba(255,255,255,.16));box-shadow:0 6px 18px rgba(0,0,0,.4)}',
     '.wbs-fork-tooltip{position:fixed;z-index:2147483647;box-sizing:border-box;width:max-content;max-width:min(255px,calc(100vw - 16px));transform:none;overflow-wrap:anywhere;white-space:normal}.wbs-fork-tooltip.is-visible{opacity:1;visibility:visible;transform:none}',
     '.wbs-fork-tooltip-title{display:block;font-size:14px;font-weight:600;line-height:1.35}.wbs-fork-tooltip-description{display:block;margin-top:3px;font-size:11px;line-height:1.5}',
     'html.cb-dark .wbs-fork-tooltip,html[data-theme="dark"] .wbs-fork-tooltip,body[data-vscode-theme-name*="dark" i] .wbs-fork-tooltip{background:var(--wb-bg-popover,#202126);color:var(--wb-color-text-primary,#f2f3f5);border-color:var(--wb-border-default,rgba(255,255,255,.16));box-shadow:0 6px 18px rgba(0,0,0,.4)}',
@@ -18748,12 +19160,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     'html.cb-dark #wbs-token-stats-modal,html[data-theme="dark"] #wbs-token-stats-modal,body[data-vscode-theme-name*="dark" i] #wbs-token-stats-modal{color-scheme:dark;background:rgba(0,0,0,.56)}#wbs-token-stats-modal .wbs-token-stats-modal{box-sizing:border-box}.wbs-token-stats-modal{position:relative}.wbs-credit-stats-toolbar{display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap;font-size:11px;color:var(--wb-icon-secondary,#667085)}.wbs-token-stats-grid.wbs-credit-stats-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.wbs-credit-chart{height:176px}.wbs-credit-sync{height:auto;min-height:28px;white-space:normal}.wbs-credit-sync-overlay{position:absolute;inset:0;z-index:5;display:flex;align-items:center;justify-content:center;padding:16px;background:color-mix(in srgb,var(--wb-bg-popover,#fff) 84%,transparent);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);border-radius:inherit;pointer-events:auto}.wbs-credit-sync-overlay[hidden],[data-credit-result][hidden],[data-usage-pane][hidden]{display:none!important}.wbs-credit-sync-progress{display:flex;flex-direction:column;align-items:stretch;gap:12px;width:min(100%,340px);font-size:12px;line-height:1.6;overflow-wrap:anywhere;color:var(--wb-color-text-primary,#1f1f1f)}.wbs-credit-sync-progress>span{color:var(--wb-icon-secondary,#667085)}.wbs-credit-sync-progress progress{width:100%;height:8px;accent-color:var(--wb-button-primary-bg,#1f1f1f)}.wbs-credit-sync-progress button{align-self:center}.wbs-usage-tabs button:focus-visible,.wbs-credit-sync:focus-visible{outline:2px solid var(--wb-color-text-primary,#1f1f1f);outline-offset:2px}',
     '@media(max-width:700px){.wbs-usage-modal-mask{padding:12px}.wbs-usage-columns{grid-template-columns:1fr}.wbs-token-stats-modal{width:calc(100vw - 24px);max-width:calc(100vw - 24px);height:calc(100vh - 24px);max-height:calc(100vh - 24px)}.wbs-token-stats-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}',
     '@media(max-width:620px){.wbs-usage-header{padding:14px 14px 0}.wbs-usage-scroll{padding:4px 14px 14px}.wbs-token-stats-modal>.wbs-modal-actions{padding:10px 14px}.wbs-trend-controls{flex-direction:column}.wbs-trend-legend{width:100%;flex:none}.wbs-usage-segment button{min-width:0}}',
-    '.wbs-modal.wbs-auto-discovery-modal{display:flex;flex-direction:column;width:min(980px,calc(100vw - 48px));max-width:calc(100vw - 48px);height:min(84vh,800px);max-height:calc(100vh - 48px);gap:0;padding:0;border:1px solid var(--wb-border-default,rgba(20,24,32,.14));border-radius:16px;box-shadow:0 24px 80px rgba(15,18,24,.22)}.wbs-auto-discovery-header{padding-bottom:14px}.wbs-auto-discovery-header .wbs-auto-modal-head{align-items:center;flex-wrap:wrap}.wbs-auto-discovery-head-actions{display:flex;align-items:center;gap:10px}.wbs-auto-discovery-header .wbs-auto-textbtn{white-space:normal;text-align:right}.wbs-auto-discovery-list{flex:1;gap:8px;padding-top:14px;scrollbar-width:thin;overscroll-behavior:contain}.wbs-auto-discovery-item{padding:13px 14px}.wbs-auto-discovery-pagination{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin:0}.wbs-auto-discovery-total{margin-right:auto;font-size:11px;color:var(--wb-color-text-secondary,#666)}.wbs-auto-discovery-page{min-width:36px;text-align:center;font-size:11px;font-variant-numeric:tabular-nums;color:var(--wb-color-text-secondary,#666)}.wbs-auto-discovery-pagination .wbs-modal-btn{min-width:54px;margin:0}.wbs-auto-discovery-pagination .wbs-modal-btn:disabled{opacity:.45;cursor:not-allowed}.wbs-auto-discovery-pagination .wbs-modal-btn:focus-visible,.wbs-auto-discovery-header button:focus-visible{outline:2px solid var(--wb-button-primary-bg,#1f1f1f);outline-offset:2px}',
+    '.wbs-modal.wbs-auto-discovery-modal{display:flex;flex-direction:column;width:min(980px,calc(100vw - 48px));max-width:calc(100vw - 48px);height:min(84vh,800px);max-height:calc(100vh - 48px);gap:0;padding:0;border:1px solid var(--wb-border-default,rgba(20,24,32,.14));border-radius:16px;box-shadow:0 24px 80px rgba(15,18,24,.22)}.wbs-auto-discovery-header{padding-bottom:14px}.wbs-auto-discovery-header .wbs-auto-modal-head{align-items:center;flex-wrap:wrap}.wbs-auto-discovery-head-actions{display:flex;align-items:center;gap:10px}.wbs-auto-discovery-header .wbs-auto-textbtn{white-space:normal;text-align:right}.wbs-auto-discovery-list{flex:1;gap:8px;padding-top:14px;scrollbar-width:thin;overscroll-behavior:contain}.wbs-auto-discovery-item{padding:13px 14px}.wbs-auto-discovery-footer{display:flex;align-items:center;margin:0}.wbs-auto-discovery-total{margin-right:auto;font-size:11px;color:var(--wb-color-text-secondary,#666)}.wbs-auto-discovery-header button:focus-visible{outline:2px solid var(--wb-button-primary-bg,#1f1f1f);outline-offset:2px}',
     '.wbs-auto-discovery-head-actions [data-auto-discovery-guide]{display:inline-flex;align-items:center;justify-content:center;min-height:30px;padding:6px 11px;border:1px solid var(--wb-button-primary-bg,#1f1f1f);border-radius:7px;background:var(--wb-button-primary-bg,#1f1f1f);color:var(--wb-button-primary-fg,#fff);font:inherit;font-size:11px;font-weight:600;text-decoration:none;white-space:nowrap;cursor:pointer;box-shadow:0 1px 2px rgba(0,0,0,.12)}.wbs-auto-discovery-head-actions [data-auto-discovery-guide]:hover{background:var(--wb-button-primary-bg-hover,var(--wb-button-primary-bg,#1f1f1f));color:var(--wb-button-primary-fg,#fff)}.wbs-auto-discovery-head-actions [data-auto-discovery-guide]:focus-visible{outline:2px solid var(--wb-button-primary-bg,#1f1f1f);outline-offset:2px}',
     '.wbs-modal.wbs-auto-guide-modal{box-sizing:border-box;width:min(520px,calc(100vw - 32px));max-width:calc(100vw - 32px);max-height:calc(100vh - 32px);overflow:auto;padding:18px 20px}.wbs-auto-guide-body{font-size:12px;line-height:1.65;color:var(--wb-color-text-secondary,#666);overflow-wrap:anywhere}.wbs-auto-guide-body p{margin:0 0 10px}.wbs-auto-guide-body .wbs-auto-textbtn{padding:0;color:var(--wb-color-text-primary,#1f1f1f);text-decoration:underline;overflow-wrap:anywhere;text-align:left}.wbs-auto-guide-modal .wbs-modal-actions{margin-top:12px}.wbs-auto-guide-body .wbs-auto-textbtn:focus-visible{outline:2px solid var(--wb-button-primary-bg,#1f1f1f);outline-offset:2px}',
     '.wbs-auto-guide-body ol{margin:8px 0 0;padding-left:20px}.wbs-auto-guide-body li{margin:0 0 8px;padding-left:2px}.wbs-auto-guide-body code{padding:2px 4px;border-radius:4px;background:var(--wb-bg-tertiary,#f2f3f5);color:var(--wb-color-text-primary,#1f1f1f);font:10.5px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}',
     'html.cb-dark #wbs-auto-discovery-mask,html[data-theme="dark"] #wbs-auto-discovery-mask,body[data-vscode-theme-name*="dark" i] #wbs-auto-discovery-mask,html.cb-dark #wbs-auto-discovery-guide,html[data-theme="dark"] #wbs-auto-discovery-guide,body[data-vscode-theme-name*="dark" i] #wbs-auto-discovery-guide{color-scheme:dark;background:rgba(0,0,0,.56)}html.cb-dark .wbs-auto-discovery-version,html[data-theme="dark"] .wbs-auto-discovery-version,body[data-vscode-theme-name*="dark" i] .wbs-auto-discovery-version{border-color:var(--wb-border-subtle,rgba(255,255,255,.18));background:var(--wb-bg-tertiary,#303137);color:var(--wb-color-text-secondary,#d0d0d5)}',
-    '@media(max-width:700px){.wbs-modal.wbs-auto-discovery-modal{width:calc(100vw - 24px);max-width:calc(100vw - 24px);height:calc(100vh - 24px);max-height:calc(100vh - 24px)}}@media(max-width:620px){.wbs-auto-discovery-header{padding-bottom:12px}.wbs-auto-discovery-pagination{gap:5px;flex-wrap:wrap}.wbs-auto-discovery-pagination .wbs-modal-btn{min-width:45px;padding:6px}.wbs-auto-discovery-total{flex-basis:100%}}',
+    '@media(max-width:700px){.wbs-modal.wbs-auto-discovery-modal{width:calc(100vw - 24px);max-width:calc(100vw - 24px);height:calc(100vh - 24px);max-height:calc(100vh - 24px)}}@media(max-width:620px){.wbs-auto-discovery-header{padding-bottom:12px}.wbs-auto-discovery-total{flex-basis:100%}}',
     /* 登录新账号二选一弹窗（方法一 假退出 / 方法二 无感登录） */
     /* 选择登录方式：遮罩限定在 WorkDaddy 面板内部，沿用会话弹窗的层级与按钮风格 */
     '.wbs-pane{position:relative}',

@@ -12,6 +12,7 @@
  */
 'use strict';
 
+const { accountIdentity } = require('./account-identity');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -427,6 +428,8 @@ function authRecordFromJson(file, json, { strict = DYNAMIC_AUTH_DISCOVERY } = {}
     uin: typeof acct.uin === 'string' || typeof acct.uin === 'number' ? acct.uin : '',
     phone: wdCompatText(acct.phoneNumber),
     type: typeof acct.type === 'string' ? acct.type : '',
+    enterpriseId: String(acct.enterpriseId || '').trim(),
+    accountId: accountIdentity(acct),
     raw: json,
     file,
     authFileName: file ? path.basename(file) : '',
@@ -1208,6 +1211,9 @@ function mergeAutoCopyLineages(dataDir, fromLineageId, intoLineageId) {
   const fromLineage = config.sessions[from];
   const intoLineage = config.sessions[into];
   if (!fromLineage || !intoLineage) return { ok: false, reason: 'missing' };
+  if (fromLineage.excludedUids || intoLineage.excludedUids) {
+    intoLineage.excludedUids = Array.from(new Set([...(intoLineage.excludedUids || []), ...(fromLineage.excludedUids || [])]));
+  }
 
   const knownMembers = new Set((intoLineage.members || []).map((member) =>
     JSON.stringify([String(member && member.uid || ''), String(member && member.id || '')])));
@@ -1333,14 +1339,53 @@ function removeAutoCopySession(dataDir, uid, sessionId) {
   return true;
 }
 
-// 真实删除路径的展开器：把要删除的会话按 lineage 扩展到全部物理副本（其他
-// 账号自动复制出来的同源会话）。否则删除某个账号的会话后，副本仍留在其他
-// 账号，切换回来时 auto-copy 会把它们原样复制回来（用户观察到的「删除后
-// 切走再切回、会话复活」现象）。无 lineage 的会话映射回自身。
-// 返回 [{ uid, id, lineageId }]；uid 可能为空（脏索引），id 必有值。
-function collectLineageMembersForDelete(dataDir, sessionIds) {
+// #511: a local deletion is a destination exclusion, never permission to erase
+// surviving siblings. Keep provenance so an all/workspace sync cannot recreate
+// the deleted copy. Explicit manual copy can still restore it.
+function recordSessionDeletion(dataDir, rows, options = {}) {
+  const families = rows.map(row => {
+    const lineageIds = new Set();
+    collectLineageMembersForDelete(dataDir, [row.id], lineageIds);
+    return { row, lineageIds };
+  });
   const meta = readMeta(dataDir);
   const config = ensureAutoCopyMeta(meta);
+  for (const { row, lineageIds } of families) {
+    const uid = String(row.user_id || '').trim();
+    const id = String(row.id || '').trim();
+    if (!uid || !id) continue;
+    for (const lineageId of lineageIds) {
+      const lineage = config.sessions[lineageId];
+      if (!lineage) continue;
+      lineage.excludedUids = Array.from(new Set([...(Array.isArray(lineage.excludedUids) ? lineage.excludedUids : []), uid]));
+    }
+    if (options.preserveMembers) continue;
+    for (const lineage of Object.values(config.sessions)) {
+      lineage.members = (lineage.members || []).filter(member => !(member.uid === uid && member.id === id));
+    }
+    if (config.sessionIndex[uid]) delete config.sessionIndex[uid][id];
+    for (const [key, mapping] of Object.entries(config.copies)) {
+      if (mapping && String(mapping.targetId || '') === id) delete config.copies[key];
+    }
+  }
+  if (!options.preserveMembers) config.duplicates = collectAutoCopyDuplicates(config);
+  writeMeta(dataDir, meta);
+  return rows.length;
+}
+
+function isAutoCopyTargetExcluded(dataDir, lineageId, uid) {
+  const lineage = readAutoCopyConfig(dataDir).sessions[String(lineageId || '')];
+  return !!(lineage && Array.isArray(lineage.excludedUids) && lineage.excludedUids.includes(String(uid || '').trim()));
+}
+
+// 仅供显式「所有账号」删除及来源关系检查使用；普通删除不展开。
+// 按 lineage 扩展到全部已关联物理副本；无 lineage 的会话映射回自身。
+// 返回 [{ uid, id, lineageId }]；uid 可能为空（脏索引），id 必有值。
+// Copy guards consult provenance repeatedly. Rebuild its graph only after the
+// meta-file fingerprint changes, rather than scanning every account per guard.
+const lineageDeleteIndexes = new WeakMap();
+function collectLineageMembersForDelete(dataDir, sessionIds, relatedLineageIds) {
+  const config = readAutoCopyConfig(dataDir);
   const ids = new Set(
     (Array.isArray(sessionIds) ? sessionIds : [])
       .map((s) => String(s || '').trim())
@@ -1350,39 +1395,45 @@ function collectLineageMembersForDelete(dataDir, sessionIds) {
   // 成员表、反向索引及历史复制映射共同证明同源关系。只查成员表会漏掉
   // 旧版复制记录，以及 normalizeAutoCopyLineages 拆出的重复物理会话。
   // 不使用标题、工作目录或消息相似度推断，避免删除独立会话。
-  const membersByLineage = new Map();
-  const lineagesBySession = new Map();
-  const lineagesByOrigin = new Map();
-  const addLink = (lineageId, memberUid, memberId) => {
-    if (!config.sessions[lineageId]) return;
-    const uid = String(memberUid || '').trim();
-    const id = String(memberId || '').trim();
-    if (!id) return;
-    if (!membersByLineage.has(lineageId)) membersByLineage.set(lineageId, new Map());
-    membersByLineage.get(lineageId).set(id, { uid, id, lineageId });
-    if (!lineagesBySession.has(id)) lineagesBySession.set(id, new Set());
-    lineagesBySession.get(id).add(lineageId);
-  };
-  for (const [lineageId, lineage] of Object.entries(config.sessions)) {
-    if (!lineage) continue;
-    const origin = String(lineage.originLineageId || lineageId);
-    if (!lineagesByOrigin.has(origin)) lineagesByOrigin.set(origin, []);
-    lineagesByOrigin.get(origin).push(lineageId);
-    for (const member of (Array.isArray(lineage.members) ? lineage.members : [])) {
-      addLink(lineageId, member && member.uid, member && member.id);
-    }
-  }
-  for (const [uid, index] of Object.entries(config.sessionIndex)) {
-    for (const [id, lineageId] of Object.entries(index || {})) addLink(String(lineageId || ''), uid, id);
-  }
-  for (const [key, mapping] of Object.entries(config.copies)) {
-    try {
-      const parts = JSON.parse(key);
-      if (Array.isArray(parts) && parts.length === 2) {
-        addLink(String(parts[0] || ''), parts[1], mapping && mapping.targetId);
+  let indexes = lineageDeleteIndexes.get(config);
+  if (!indexes) {
+    const membersByLineage = new Map();
+    const lineagesBySession = new Map();
+    const lineagesByOrigin = new Map();
+    const addLink = (lineageId, memberUid, memberId) => {
+      if (!config.sessions[lineageId]) return;
+      const uid = String(memberUid || '').trim();
+      const id = String(memberId || '').trim();
+      if (!id) return;
+      if (!membersByLineage.has(lineageId)) membersByLineage.set(lineageId, new Map());
+      membersByLineage.get(lineageId).set(id, { uid, id, lineageId });
+      if (!lineagesBySession.has(id)) lineagesBySession.set(id, new Set());
+      lineagesBySession.get(id).add(lineageId);
+    };
+    for (const [lineageId, lineage] of Object.entries(config.sessions)) {
+      if (!lineage) continue;
+      const origin = String(lineage.originLineageId || lineageId);
+      if (!lineagesByOrigin.has(origin)) lineagesByOrigin.set(origin, []);
+      lineagesByOrigin.get(origin).push(lineageId);
+      for (const member of (Array.isArray(lineage.members) ? lineage.members : [])) {
+        addLink(lineageId, member && member.uid, member && member.id);
       }
-    } catch (_) { /* Malformed legacy keys cannot establish a copy relationship. */ }
+    }
+    for (const [uid, index] of Object.entries(config.sessionIndex)) {
+      for (const [id, lineageId] of Object.entries(index || {})) addLink(String(lineageId || ''), uid, id);
+    }
+    for (const [key, mapping] of Object.entries(config.copies)) {
+      try {
+        const parts = JSON.parse(key);
+        if (Array.isArray(parts) && parts.length === 2) {
+          addLink(String(parts[0] || ''), parts[1], mapping && mapping.targetId);
+        }
+      } catch (_) { /* Malformed legacy keys cannot establish a copy relationship. */ }
+    }
+    indexes = { membersByLineage, lineagesBySession, lineagesByOrigin };
+    lineageDeleteIndexes.set(config, indexes);
   }
+  const { membersByLineage, lineagesBySession, lineagesByOrigin } = indexes;
   const members = [];
   const seenIds = new Set();
   const seenLineages = new Set();
@@ -1396,6 +1447,7 @@ function collectLineageMembersForDelete(dataDir, sessionIds) {
       const lineageId = pending[i];
       if (seenLineages.has(lineageId)) continue;
       seenLineages.add(lineageId);
+      if (relatedLineageIds) relatedLineageIds.add(lineageId);
       const lineage = config.sessions[lineageId];
       const origin = String(lineage.originLineageId || lineageId);
       for (const related of lineagesByOrigin.get(origin) || []) {
@@ -1539,6 +1591,44 @@ function deleteAutoCopyMapping(dataDir, lineageOrUid, targetUid, maybeSessionId)
 function logFile(dataDir) {
   return path.join(dataDir, 'daemon.log');
 }
+function migrateAccountIdentities(dataDir) {
+  const dir = accountsDir(dataDir);
+  let names;
+  try { names = fs.readdirSync(dir).filter(name => name.endsWith('.info')); } catch (_) { return; }
+  let meta = null;
+  for (const name of names) {
+    const file = path.join(dir, name);
+    const info = parseAuthFile(file, { strict: false });
+    if (!info || name !== info.uid + '.info' || info.accountId === info.uid) continue;
+    const target = path.join(dir, info.accountId + '.info');
+    // Keep a pre-existing scoped backup and preserve the old bytes for recovery.
+    if (fs.existsSync(target)) fs.renameSync(file, file + '.legacy.' + crypto.randomUUID());
+    else fs.renameSync(file, target);
+    if (!meta) meta = readMeta(dataDir);
+    rememberAccountIdentity(meta, info.uid, info.accountId);
+    meta.accounts[info.accountId] = Object.assign({}, meta.accounts[info.uid], meta.accounts[info.accountId], {
+      uid: info.accountId, rawUid: info.uid, type: info.type, enterpriseId: info.enterpriseId,
+    });
+    delete meta.accounts[info.uid];
+    // Historical uid-only session links have no reliable login-context owner.
+    // Retain a recovery snapshot, then retire just this owner's links so a later
+    // personal login cannot silently inherit the enterprise's synchronization.
+    if (meta.autoCopy) {
+      if (!meta.retiredAccountSyncRules) meta.retiredAccountSyncRules = {};
+      if (!meta.retiredAccountSyncRules[info.accountId]) meta.retiredAccountSyncRules[info.accountId] = JSON.parse(JSON.stringify(meta.autoCopy));
+      const config = ensureAutoCopyMeta(meta);
+      delete config.sessionIndex[info.uid];
+      for (const lineage of Object.values(config.sessions)) {
+        lineage.members = (lineage.members || []).filter(member => member.uid !== info.uid);
+      }
+      for (const key of Object.keys(config.copies)) {
+        try { if (JSON.parse(key)[1] === info.uid) delete config.copies[key]; } catch (_) {}
+      }
+    }
+  }
+  if (meta) writeMeta(dataDir, meta);
+}
+
 function backupPath(dataDir, uid) {
   return path.join(accountsDir(dataDir), `${uid}.info`);
 }
@@ -1654,16 +1744,27 @@ function readAuthFile(file = currentAuthFile()) {
 /** 更新 meta.json（uid -> nickname/uin/phone/时间）。preserveBinding：备份扫描路径
  *  不漂移「账号 -> 登录文件」绑定——auth 目录里的个性化历史存档（带时间戳）即使
  *  残留 lastLogin 标记，也不得覆盖切换路径建立的绑定关系。 */
+function knownAccountIdentities(dataDir) { return readMeta(dataDir).accountIdentities || {}; }
+function rememberAccountIdentity(meta, rawUid, uid) {
+  if (!meta.accountIdentities || typeof meta.accountIdentities !== 'object') meta.accountIdentities = {};
+  if (!Array.isArray(meta.accountIdentities[rawUid])) meta.accountIdentities[rawUid] = [];
+  if (!meta.accountIdentities[rawUid].includes(uid)) meta.accountIdentities[rawUid].push(uid);
+}
 function updateMeta(dataDir, info, { preserveBinding = false } = {}) {
   const meta = readMeta(dataDir);
   const now = Date.now();
-  const prev = meta.accounts[info.uid] || {};
+  const id = info.accountId || accountIdentity(info);
+  rememberAccountIdentity(meta, info.rawUid || info.uid, id);
+  const prev = meta.accounts[id] || {};
   let authFileName = info.authFileName || prev.authFileName || '';
   if (preserveBinding && prev.authFileName && info.authFileName && prev.authFileName !== info.authFileName) {
     authFileName = prev.authFileName;
   }
-  meta.accounts[info.uid] = {
-    uid: info.uid,
+  meta.accounts[id] = {
+    uid: id,
+    rawUid: info.uid,
+    type: info.type || '',
+    enterpriseId: info.enterpriseId || '',
     nickname: info.nickname || prev.nickname || '',
     uin: info.uin || prev.uin || '',
     phone: info.phone || prev.phone || '',
@@ -1680,8 +1781,9 @@ function updateMeta(dataDir, info, { preserveBinding = false } = {}) {
 }
 
 function backupAuthFile(dataDir, file, log = () => {}) {
+  migrateAccountIdentities(dataDir);
   const info = readAuthFile(file);
-  const dest = backupPath(dataDir, info.uid);
+  const dest = backupPath(dataDir, info.accountId);
   const tmp = dest + '.tmp';
   // [wd-compat] 密文信封原样落盘；需要查询/刷新时才在内存中解密。
   // 这样不会在 WorkDaddy 目录制造明文 token 副本，也能保留旧版明文 auth 文件。
@@ -1702,6 +1804,7 @@ function backupAuthFile(dataDir, file, log = () => {}) {
 function backupCurrent(dataDir, log = () => {}) {
   if (!ACTIVE_PROFILE.capabilities.accounts) throw new Error(`${ACTIVE_PROFILE.name} 暂不支持账号文件备份`);
   ensureDirs(dataDir, log);
+  migrateAccountIdentities(dataDir);
   const records = listAuthRecords();
   if (!records.length) throw new Error('未找到有效的登录信息文件');
   const current = resolveCurrentAuth();
@@ -1709,7 +1812,7 @@ function backupCurrent(dataDir, log = () => {}) {
   let backedUp = 0;
   for (const record of records) {
     const authoritative = current.file && samePath(record.file, current.file);
-    const existingBackup = fs.existsSync(backupPath(dataDir, record.uid));
+    const existingBackup = fs.existsSync(backupPath(dataDir, record.accountId));
     if (existingBackup && !authoritative) continue; // 历史存档不覆盖已有备份
     const info = backupAuthFile(dataDir, record.file, log);
     backedUp += 1;
@@ -1744,13 +1847,13 @@ function resolveAuthTarget(dataDir, uid, authJson) {
     return target;
   }
   const records = listAuthRecords();
-  const matching = records.filter((item) => item.uid === String(uid));
+  const matching = records.filter((item) => item.accountId === String(uid));
   if (matching.length === 1) return matching[0].file;
   const channelMatches = records.filter(sameChannel);
   const canonical = channelMatches.find((item) => AUTH_FILE && samePath(item.file, AUTH_FILE));
   if (canonical) return canonical.file;
   if (channelMatches.length === 1) return channelMatches[0].file;
-  const legacyRecord = String(record.uid || '') === String(uid) &&
+  const legacyRecord = String(record.accountId || record.uid || '') === String(uid) &&
     !record.authFileName && !record.authDomain && !record.authIssuer;
   // legacy 账号（动态发现上线前备份）没有属于自己的文件记录，其唯一正确的落点就是
   // 官方固定登录文件（AUTH_FILE）；无论该文件当前是否被占用，用户显式切换即意图覆盖。
@@ -1798,6 +1901,7 @@ function setAccountNote(dataDir, value) {
 function listAccounts(dataDir) {
   if (!ACTIVE_PROFILE.capabilities.accounts) return [];
   migrateLegacyDataDir(dataDir);
+  migrateAccountIdentities(dataDir);
   const dir = accountsDir(dataDir);
   let names = [];
   try {
@@ -1832,6 +1936,8 @@ function listAccounts(dataDir) {
         item.nickname = wdCompatText(acct.nickname);
         item.phone = wdCompatText(acct.phoneNumber);
         item.uin = typeof acct.uin === 'string' || typeof acct.uin === 'number' ? acct.uin : '';
+        item.rawUid = String(acct.uid || uid);
+        item.enterpriseId = String(acct.enterpriseId || '').trim();
         item.type = typeof acct.type === 'string' ? acct.type : '';
         item.enterpriseName = typeof acct.enterpriseName === 'string' ? acct.enterpriseName.trim() : '';
       }
@@ -1860,7 +1966,7 @@ function deleteAuthFilesForUid(uid, log = () => {}) {
   if (!AUTH_FILE) return { removed: 0 };
   if (!DYNAMIC_AUTH_DISCOVERY) {
     const record = parseAuthFile(AUTH_FILE, { strict: false });
-    if (record && record.uid === uid && fs.existsSync(AUTH_FILE)) {
+    if (record && record.accountId === uid && fs.existsSync(AUTH_FILE)) {
       fs.unlinkSync(AUTH_FILE);
       log(`[delete] 已删除固定登录文件 ${path.basename(AUTH_FILE)}`);
       return { removed: 1 };
@@ -1875,7 +1981,7 @@ function deleteAuthFilesForUid(uid, log = () => {}) {
     if (!safeAuthFileName(name)) continue;
     const file = path.join(dir, name);
     const record = parseAuthFile(file);
-    if (record && record.uid === uid && fs.existsSync(file)) {
+    if (record && record.accountId === uid && fs.existsSync(file)) {
       try {
         fs.unlinkSync(file);
         removed += 1;
@@ -1895,7 +2001,7 @@ function deleteAccount(dataDir, uid, log = () => {}) {
   const current = resolveCurrentAuth();
   if (current.file && !current.ambiguous) {
     const record = parseAuthFile(current.file, { strict: false });
-    if (record && record.uid === uid) {
+    if (record && record.accountId === uid) {
       throw new Error('不能删除当前登录的账号（请先退出登录或切换到其他账号）');
     }
   }
@@ -1933,6 +2039,7 @@ function deleteAccount(dataDir, uid, log = () => {}) {
 function switchTo(dataDir, uid, log = () => {}) {
   if (!ACTIVE_PROFILE.capabilities.accounts) throw new Error(`${ACTIVE_PROFILE.name} 暂不支持账号切换`);
   migrateLegacyDataDir(dataDir, log);
+  migrateAccountIdentities(dataDir);
   // 不再用「当前 auth 目录是否 ambiguous」一票否决：切换写入的目标文件由
   // resolveAuthTarget 精确决定（meta.json 记录 / 唯一 uid 匹配），目标无法唯一
   // 确定时它自己会拒绝，避免历史 lastLogin 残留导致已登录账号切不回去。
@@ -1943,7 +2050,7 @@ function switchTo(dataDir, uid, log = () => {}) {
   const raw = fs.readFileSync(src, 'utf8');
   const json = wdCompatDecryptAuthJson(JSON.parse(raw)); // [wd-compat] 校验前解密；写回仍用 raw 原字节
   const acct = json.account || (Array.isArray(json.accounts) && json.accounts[0]);
-  if (!acct || acct.uid !== uid) {
+  if (!acct || accountIdentity(acct) !== uid) {
     throw new Error('备份文件校验失败：uid 不匹配，已中止切换');
   }
   const target = resolveAuthTarget(dataDir, uid, json);
@@ -1984,7 +2091,9 @@ function switchTo(dataDir, uid, log = () => {}) {
   // Legacy call shape retained for source-compatible launchers: retireLogoutMarker(log);
   retireLogoutMarker(log, target);
   updateMeta(dataDir, {
-    uid: acct.uid,
+    uid: String(acct.uid),
+    type: acct.type,
+    enterpriseId: acct.enterpriseId,
     nickname: wdCompatText(acct.nickname),
     uin: typeof acct.uin === 'string' || typeof acct.uin === 'number' ? acct.uin : '',
     phone: wdCompatText(acct.phoneNumber),
@@ -1994,7 +2103,7 @@ function switchTo(dataDir, uid, log = () => {}) {
   });
   const switchName = wdCompatText(acct.nickname) || uid;
   log(`[switch] 已切换登录账号为 ${switchName} (${uid})`);
-  return { uid: acct.uid, nickname: wdCompatText(acct.nickname), uin: typeof acct.uin === 'string' || typeof acct.uin === 'number' ? acct.uin : '', authFile: target };
+  return { uid, rawUid: String(acct.uid), type: acct.type, enterpriseId: acct.enterpriseId, nickname: wdCompatText(acct.nickname), uin: typeof acct.uin === 'string' || typeof acct.uin === 'number' ? acct.uin : '', authFile: target };
 }
 
 module.exports = {
@@ -2051,6 +2160,8 @@ module.exports = {
   importModels,
   logFile,
   backupPath,
+  migrateAccountIdentities,
+  knownAccountIdentities,
   backupAuthFile,
   retireLogoutMarker,
   ensureDirs,
@@ -2076,6 +2187,8 @@ module.exports = {
   removeAutoCopySession,
   removeAutoCopyAccount,
   collectLineageMembersForDelete,
+  recordSessionDeletion,
+  isAutoCopyTargetExcluded,
   getAutoCopyMapping,
   getAutoCopyMappings,
   migrateAutoCopyTargetRevisions,

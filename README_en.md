@@ -1,6 +1,6 @@
 <h1><img src="docs/images/workdaddy-app-icon-rounded.svg" alt="" width="40" height="40" align="absmiddle">  WorkDaddy</h1>
 
-**Language:** [简体中文](README.md) · [English](README_en.md)
+**Language:** [简体中文](README.md) · [English](README_en.md) · [日本語](README_ja.md)
 
 > **WorkDaddy / CodeDaddy enhance WorkBuddy and CodeBuddy desktop clients with separate account backups, account switching, session migration, model management, and automations. WorkBuddy also supports quiet approvals, auto-continue, prompt stashing, quick phrases, and five themes. Accounts and configuration stay on your computer.**
 > Local loopback CDP injection · the official installation is never modified.
@@ -11,6 +11,21 @@ CodeBuddy support targets its **Electron agent window**, not the VS Code editor 
 ![License](https://img.shields.io/badge/license-AGPL--3.0-blueviolet)
 ![Platform](https://img.shields.io/badge/platform-macOS%2011%2B%20%7C%20Windows%2010%2F11%20%7C%20Linux-lightgrey)
 ![Node](https://img.shields.io/badge/node-%E2%89%A522.13-green)
+
+---
+
+## 💖 Sponsors
+
+> Want to be featured here? **Early sponsor slots are CNY 99/month.** Contact [richdaddycashmany@163.com](mailto:richdaddycashmany@163.com).
+
+<table>
+<tr>
+<td width="180" align="center" valign="middle">
+  <a href="https://nagora.ai/"><img src="docs/images/nagora.png" alt="Nagora" width="150"></a>
+</td>
+<td valign="middle"><a href="https://nagora.ai/">Nagora</a> is a multi-model AI API gateway built for developers and teams. With a single account and API key, you can access more than 26 leading text and image models through one unified interface. It is compatible with OpenAI, Anthropic, and Gemini protocols and integrates seamlessly with development tools such as Claude Code, Codex, and Gemini CLI. The platform provides intelligent routing, automatic failover, transparent pricing, and consolidated billing, along with budget management, rate limiting, and concurrency controls. This makes AI usage more reliable and manageable across individual development, team collaboration, and production environments. No changes to your existing application are required. Simply replace the Base URL and API key to complete the integration in as little as one minute.</td>
+</tr>
+</table>
 
 ---
 

@@ -1,6 +1,6 @@
 <h1><img src="docs/images/workdaddy-app-icon-rounded.svg" alt="" width="40" height="40" align="absmiddle">  WorkDaddy</h1>
 
-**语言：** [简体中文](README.md) · [English](README_en.md)
+**语言：** [简体中文](README.md) · [English](README_en.md) · [日本語](README_ja.md)
 
 > **WorkDaddy 是 WorkBuddy 和 CodeBuddy 桌面端增强助手：多账号独立备份、点切即用，跨账号会话迁移、模型管理与自动化任务。WorkBuddy 还支持免打扰、异常中断自动续接、暂存/快捷提示词和五种主题。账号与配置全部留在本机。**
 > 本机回环 CDP 注入 · 不改官方安装包。
@@ -11,6 +11,21 @@ CodeBuddy 支持范围为 **Electron 智能体窗口**，不包含 VS Code 编�
 ![License](https://img.shields.io/badge/license-AGPL--3.0-blueviolet)
 ![Platform](https://img.shields.io/badge/platform-macOS%2011%2B%20%7C%20Windows%2010%2F11%20%7C%20Linux-lightgrey)
 ![Node](https://img.shields.io/badge/node-%E2%89%A522.13-green)
+
+---
+
+## 💖 赞助商
+
+> 想出现在这里？**首批广告位 99 元/月**，欢迎联系 [richdaddycashmany@163.com](mailto:richdaddycashmany@163.com)。
+
+<table>
+<tr>
+<td width="180" align="center" valign="middle">
+  <a href="https://nagora.ai/"><img src="docs/images/nagora.png" alt="Nagora" width="150"></a>
+</td>
+<td valign="middle"><a href="https://nagora.ai/">Nagora</a> 是专为开发者和团队打造的多模型 AI API 网关。通过一个账户和一枚 API Key，即可统一调用 26+ 款主流文本与图像模型，兼容 OpenAI、Anthropic 与 Gemini 协议，并可无缝接入 Claude Code、Codex、Gemini CLI 等开发工具。平台提供智能路由、自动故障转移、透明计费与统一账单，同时支持预算、限速、并发控制，让个人开发、团队协作和生产环境中的 AI 调用更稳定、更可控。无需改造现有应用，只需替换 Base URL 与 API Key，最快 1 分钟即可完成接入。</td>
+</tr>
+</table>
 
 ---
 
@@ -95,6 +110,10 @@ node scripts/workbuddy-target.js --configure --platform darwin \
   --binary "/Applications/企业客户端.app/Contents/MacOS/Electron" \
   --data-dir "$HOME/Library/Application Support/WorkDaddy"
 ```
+
+### 会话工作目录恢复
+
+默认不会自动重建已删除的会话工作目录。旧会话需要原目录时，请手动恢复目录；如需启用 Windows 上的自动恢复，可在启动 WorkDaddy 前设置环境变量 `WORKDADDY_REPAIR_MISSING_SESSION_WORKSPACES=1`。启用后，缺失目录会被定期重建。
 
 ### Windows
 
